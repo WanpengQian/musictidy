@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}艺人 — MusicTidy{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1>艺人 <span class="muted small">({{ artists|length }})</span></h1>
+  <form class="filter-bar" method="get" action="/artists"
+        hx-get="/artists" hx-target="#artist-list" hx-select="#artist-list"
+        hx-swap="outerHTML" hx-push-url="true" hx-trigger="change">
+    <label>排序
+      <select name="sort">
+        {% for k, label in [('completeness','完整度'),('owned','拥有数'),('alpha','字母'),('items','文件数')] %}
+        <option value="{{ k }}" {% if sort == k %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>显示
+      <select name="filter">
+        {% for k, label in [('all','全部'),('incomplete','未完整'),('complete','已完整'),('no_mb_cache','MB 缓存未到')] %}
+        <option value="{{ k }}" {% if filter == k %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <noscript><button type="submit">应用</button></noscript>
+  </form>
+</section>
+
+{% include "_artist_list.html" %}
+{% endblock %}

@@ -1,0 +1,53 @@
+# beets 配置示例
+# 装到 $XDG_CONFIG_HOME/beets/config.yaml
+# 在 FreeBSD 服务模式下，可以指向 /var/db/musictidy/.config/beets/config.yaml
+# 或者在 .env 里设 BEETSDIR
+
+directory: /zdata/music         # 同你的 MUSIC_ROOT
+library:   /var/db/musictidy/library.db
+
+# 我们关键的一条：扫描阶段不动用户文件
+import:
+  copy: no
+  move: no
+  write: no       # 不在 import 时写 tag（我们走 mutagen 自己控）
+  autotag: yes
+  quiet: yes
+  log: /var/log/musictidy-beets-import.log
+  # 低置信度不强行匹配，留待 review-later
+  timid: yes
+  # 不交互式（我们是非交互的 batch 调用）
+
+# Path template —— auto_organize 时按这个走
+paths:
+  default:        $albumartist/$album%aunique{}/$track $title
+  singleton:      Non-Album/$artist - $title
+  comp:           Compilations/$album%aunique{}/$track $title
+
+# 启用的插件
+plugins: chroma fetchart embedart info missing duplicates
+
+# chroma（指纹）
+chroma:
+  auto: yes
+  fpcalc_path: /usr/local/bin/fpcalc   # FreeBSD pkg 安装位置
+
+# AcoustID（需要免费 API key，从 acoustid.org 注册）
+acoustid:
+  apikey: REPLACE_ME
+
+# fetchart（封面）
+fetchart:
+  auto: yes
+  cautious: yes
+  cover_names: front cover
+  sources: coverart itunes amazon
+
+# 元数据规范
+musicbrainz:
+  user_agent: MusicTidy/0.1 ( you@example.com )
+
+# 文件类型识别 —— 给 APE 留位置
+match:
+  preferred:
+    media: ['CD', 'Digital Media']

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}MusicTidy{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand">MusicTidy</a>
+    <nav>
+      <a href="/artists">艺人</a>
+      <a href="/duplicates">重复</a>
+      <a href="/organize">归档</a>
+      <a href="/archives">压缩包</a>
+    </nav>
+    <div class="grow"></div>
+    <a href="/docs" class="muted small">API</a>
+    <form method="post" action="/logout" style="display:inline; margin-left:1em;">
+      <button type="submit" class="logout-btn">登出</button>
+    </form>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

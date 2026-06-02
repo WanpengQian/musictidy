@@ -1,0 +1,139 @@
+"""文件系统扫描 → 投喂 beets import.
+
+流程：
+1. walk MUSIC_ROOT，找所有 audio 扩展名
+2. 跟 beets 已知 paths 做 diff
+3. 新文件逐个 import_file（不动文件，只读 tags 写 DB）
+4. 给所有还没指纹化/识别的 item enqueue 'fingerprint'（占位，worker 后续实现）
+
+第一次跑可能要几分钟（取决于 IO + tag 读取），之后增量很快。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+from app import archive, beets_bridge, cuesplit
+from app.config import get_settings
+from app.workers import queue
+
+# 全局 scan 锁：APScheduler / admin endpoint / iOS 下拉同时触发也只跑一个
+_scan_lock = asyncio.Lock()
+
+log = logging.getLogger(__name__)
+
+AUDIO_EXTS = {
+    ".flac", ".ape", ".mp3", ".m4a", ".aac",
+    ".ogg", ".opus", ".wav", ".wv", ".alac",
+}
+
+
+def walk_audio_files(root: Path) -> Iterator[Path]:
+    """递归 yield 所有音频文件的绝对 path."""
+    if not root.exists():
+        log.warning("MUSIC_ROOT 不存在: %s", root)
+        return
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in AUDIO_EXTS:
+            continue
+        # 跳过隐藏目录（.trash, .git, .Spotlight-V100, ...）
+        if any(part.startswith(".") for part in p.relative_to(root).parts):
+            continue
+        yield p.resolve()
+
+
+async def scan_and_import() -> dict[str, int]:
+    """主入口：扫库 → import 新文件 → enqueue 指纹 + CUE 切轨任务.
+
+    并发安全：全局 _scan_lock 保证同时只跑一个 scan。第二个调用
+    立即返回 skipped 而不是等锁——免得 iOS 下拉刷新累加阻塞.
+    """
+    if _scan_lock.locked():
+        log.info("scan: already running, skipping this trigger")
+        return {"skipped": True, "reason": "already running"}
+
+    async with _scan_lock:
+        return await _do_scan()
+
+
+async def _do_scan() -> dict[str, int]:
+    s = get_settings()
+    started = time.time()
+    log.info("scan: starting; music_root=%s", s.music_root)
+
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+
+    known = beets_bridge.all_known_paths(lib)
+    log.info("scan: %d already in beets", len(known))
+
+    # 先找 CUE+源音频对 —— 这些源音频要 import 但不该指纹（指纹算的是整张专辑，毫无价值）
+    cue_pairs = cuesplit.detect_pairs(s.music_root)
+    cue_src_paths = {p[1].resolve() for p in cue_pairs}
+    log.info("scan: 发现 %d 个 CUE+音频对", len(cue_pairs))
+
+    stats = beets_bridge.ImportStats()
+    new_ids_to_fp: list[int] = []
+
+    for path in walk_audio_files(s.music_root):
+        stats.scanned += 1
+        if path in known:
+            stats.skipped += 1
+            continue
+        item_id = beets_bridge.import_file(lib, path)
+        if item_id is None:
+            stats.failed += 1
+        else:
+            stats.added += 1
+            # CUE 整轨源 → 不排指纹（让 cue_split worker 处理后产生的分轨再来排）
+            if path.resolve() not in cue_src_paths:
+                new_ids_to_fp.append(item_id)
+
+        if stats.scanned % 1000 == 0:
+            log.info(
+                "scan: %d scanned, %d added, %d skipped, %d failed",
+                stats.scanned, stats.added, stats.skipped, stats.failed,
+            )
+
+    if new_ids_to_fp:
+        queue.enqueue_many(
+            "fingerprint",
+            [{"item_id": iid} for iid in new_ids_to_fp],
+        )
+
+    # 入队 CUE 切轨任务
+    if cue_pairs:
+        queue.enqueue_many(
+            "cue_split",
+            [{"cue": str(cue), "src_audio": str(src)} for cue, src in cue_pairs],
+        )
+        log.info("scan: 已排 %d 个 cue_split 任务", len(cue_pairs))
+
+    # 入队压缩档解压任务（zip/rar/7z；已解过的也会进队列，worker 直接收档到 trash）
+    archives_found = archive.detect_archives(s.music_root)
+    if archives_found:
+        queue.enqueue_many(
+            "archive_extract",
+            [{"archive": str(a)} for a in archives_found],
+        )
+        log.info("scan: 已排 %d 个 archive_extract 任务", len(archives_found))
+
+    elapsed = time.time() - started
+    log.info(
+        "scan: done in %.1fs — %d scanned, %d added, %d skipped, %d failed, %d cue_split",
+        elapsed, stats.scanned, stats.added, stats.skipped, stats.failed, len(cue_pairs),
+    )
+
+    return {
+        "scanned": stats.scanned,
+        "added": stats.added,
+        "skipped": stats.skipped,
+        "failed": stats.failed,
+        "cue_splits_enqueued": len(cue_pairs),
+        "elapsed_sec": round(elapsed, 2),
+    }

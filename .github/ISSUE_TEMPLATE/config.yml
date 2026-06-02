@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: mailto:security@musictidy.com
+    about: Don't open a public issue — email us privately first.
+  - name: Documentation / deployment help
+    url: https://musictidy.com/deploy
+    about: Step-by-step guide for self-hosting.

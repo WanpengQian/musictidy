@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}重复检测 — MusicTidy{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1>重复文件 <span class="muted small">({{ groups|length }} 组)</span></h1>
+  <p class="muted small">同一 MusicBrainz 录音 ID 但多个文件 = 同曲多格式。
+  系统推荐 ✓ 的是 <strong>无损优先</strong>；其他建议删除 (✗)。</p>
+</section>
+
+{% if not groups %}
+<p class="empty muted">
+  当前没找到重复。可能原因：还没识别到指纹级 / 真的没重复。
+</p>
+{% endif %}
+
+<div class="dup-list">
+{% for g in groups %}
+<div class="dup-group">
+  <header class="dup-group__head">
+    <span class="dup-group__title">{{ g.title or "(无标题)" }}</span>
+    <span class="muted small">{{ g.artist }} — {{ g.album }}</span>
+    <span class="badge">{{ g.count }} 个文件</span>
+  </header>
+  <table class="dup-files">
+    <thead>
+      <tr>
+        <th>建议</th>
+        <th>格式</th>
+        <th>码率</th>
+        <th>采样</th>
+        <th>时长</th>
+        <th class="path-col">路径</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in g.files %}
+      <tr class="dup-file {% if f.recommended %}dup-file--keep{% else %}dup-file--drop{% endif %}">
+        <td>{% if f.recommended %}<span class="ok">✓ 保留</span>{% else %}<span class="warn">✗ 删除</span>{% endif %}</td>
+        <td><strong>{{ f.format }}</strong></td>
+        <td>{% if f.bitrate %}{{ (f.bitrate / 1000) | int }} kbps{% endif %}</td>
+        <td>{% if f.samplerate %}{{ f.samplerate }}{% endif %}</td>
+        <td>{% if f.length %}{{ ((f.length // 60) | int) }}:{{ "%02d"|format((f.length % 60) | int) }}{% endif %}</td>
+        <td class="path-col">
+          <span class="muted small">{{ f.dir }}/</span><br>
+          <span>{{ f.filename }}</span>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+</div>
+{% endblock %}

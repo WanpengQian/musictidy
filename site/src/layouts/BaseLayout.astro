@@ -1,0 +1,53 @@
+---
+import "../styles/global.css";
+interface Props {
+  title?: string;
+  description?: string;
+}
+const { title = "MusicTidy", description = "你的音乐，自托管。MusicTidy 把散落的本地音乐整理成一座干净的私有音乐馆，iPhone 上听就跟 Apple Music 一样顺。" } = Astro.props;
+const fullTitle = title === "MusicTidy" ? "MusicTidy — 自托管音乐馆" : `${title} · MusicTidy`;
+---
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content={description} />
+  <meta name="theme-color" content="#0d0a1f" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="canonical" href={Astro.url.href} />
+  <meta property="og:title" content={fullTitle} />
+  <meta property="og:description" content={description} />
+  <meta property="og:type" content="website" />
+  <title>{fullTitle}</title>
+</head>
+<body>
+  <header class="nav">
+    <div class="container nav-row">
+      <a class="brand" href="/">
+        <img src="/favicon.svg" alt="" />
+        MusicTidy
+      </a>
+      <nav class="nav-links">
+        <a href="/deploy">部署</a>
+        <a href="/support">Support</a>
+        <a href="/privacy">隐私</a>
+        <a href="https://github.com/WanpengQian/MusicTidy" target="_blank" rel="noopener">GitHub ↗</a>
+      </nav>
+    </div>
+  </header>
+  <main>
+    <slot />
+  </main>
+  <footer class="footer">
+    <div class="container footer-row">
+      <div>MusicTidy · 开源 (MIT) · 自托管</div>
+      <div class="footer-links">
+        <a href="/privacy">隐私政策</a>
+        <a href="/support">Support</a>
+        <a href="https://github.com/WanpengQian/MusicTidy" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

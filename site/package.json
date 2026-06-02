@@ -1,0 +1,15 @@
+{
+  "name": "musictidy-site",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview --port 4321"
+  },
+  "dependencies": {
+    "astro": "^4.16.0"
+  }
+}

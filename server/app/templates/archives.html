@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}压缩包诊断 — MusicTidy{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1>压缩包诊断</h1>
+  <p class="muted small">
+    music_root 下的 <code>.rar</code> / <code>.zip</code> / <code>.7z</code> 现状。
+    扫库时遇到压缩包会自动 enqueue <code>archive_extract</code>，
+    解压成功后源档进 <code>trash/</code>。
+  </p>
+  <p>
+    <strong style="color: var(--missing)">{{ verdict }}</strong>
+  </p>
+  <p>
+    <button onclick="triggerScan()" class="apply-btn">触发 scan</button>
+    <span id="scan-result" class="muted small" style="margin-left:1em;"></span>
+  </p>
+</section>
+
+<section>
+  <h2 style="margin-top:1.4em">环境</h2>
+  <table class="org-moves" style="max-width:540px">
+    <tbody>
+      <tr>
+        <td><code>ALLOW_FILE_WRITES</code></td>
+        <td>
+          {% if allow_file_writes %}
+            <span class="ok small">✓ true</span>
+          {% else %}
+            <span style="color: var(--missing)" class="small">✗ false — worker 跳过</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td><code>unar</code> binary</td>
+        <td>
+          {% if unar_available %}
+            <span class="ok small">✓ on PATH</span>
+          {% else %}
+            <span style="color: var(--missing)" class="small">✗ 未找到 — apt/brew install unar</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>music_root</td>
+        <td><code>{{ music_root }}</code></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2 style="margin-top:1.4em">
+    待解压 <span class="muted small">({{ pending|length }})</span>
+  </h2>
+  {% if pending %}
+  <table class="org-moves">
+    <thead>
+      <tr><th class="path-col">路径</th><th>大小</th></tr>
+    </thead>
+    <tbody>
+      {% for f in pending %}
+      <tr>
+        <td class="path-col"><code>{{ f.rel }}</code></td>
+        <td class="small">{{ "%.1f" | format(f.size_mb) }} MB</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted small">没有待解压的档。</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2 style="margin-top:1.4em">
+    已解压 <span class="muted small">({{ extracted|length }})</span>
+    {% if extracted %}
+    <button type="button" class="link-btn" onclick="toggle('extracted')">展开 ▾</button>
+    {% endif %}
+  </h2>
+  {% if extracted %}
+  <div id="extracted" hidden>
+    <table class="org-moves">
+      <thead>
+        <tr><th class="path-col">路径（源档还在）</th><th>大小</th></tr>
+      </thead>
+      <tbody>
+        {% for f in extracted %}
+        <tr class="row--noop">
+          <td class="path-col"><code>{{ f.rel }}</code></td>
+          <td class="small">{{ "%.1f" | format(f.size_mb) }} MB</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted small">
+      源档应当在解压后被挪到 <code>trash/</code>。如果还在这里说明
+      <code>_move_to_trash</code> 失败 / trash_dir 不可写。
+    </p>
+  </div>
+  {% endif %}
+</section>
+
+<section>
+  <h2 style="margin-top:1.4em">
+    任务队列
+    {% if queue_counts %}
+    <span class="muted small">
+      ({% for s, n in queue_counts.items() %}{{ s }}: {{ n }}{% if not loop.last %} · {% endif %}{% endfor %})
+    </span>
+    {% endif %}
+  </h2>
+  {% if queue_rows %}
+  <table class="org-moves">
+    <thead>
+      <tr>
+        <th>id</th><th>status</th><th>tries</th>
+        <th>created</th><th>finished</th><th>last_error</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in queue_rows %}
+      <tr class="{% if r.status == 'failed' %}row--noop{% endif %}">
+        <td class="small">{{ r.id }}</td>
+        <td class="small">{{ r.status }}</td>
+        <td class="small">{{ r.attempts }}</td>
+        <td class="small">{{ r.created_at }}</td>
+        <td class="small">{{ r.finished_at or '' }}</td>
+        <td class="small">{% if r.last_error %}<code>{{ r.last_error[:200] }}</code>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted small">archive_extract 队列里没有任务。POST <code>/api/v1/admin/scan</code> 触发一次。</p>
+  {% endif %}
+</section>
+
+<script>
+function toggle(id){
+  const el = document.getElementById(id);
+  const btn = event.currentTarget;
+  if (el.hidden){ el.hidden = false; btn.textContent = '收起 ▴'; }
+  else { el.hidden = true; btn.textContent = '展开 ▾'; }
+}
+
+async function triggerScan(){
+  const out = document.getElementById('scan-result');
+  out.textContent = '触发中…';
+  try {
+    const r = await fetch('/api/v1/admin/scan', {method: 'POST'});
+    const data = await r.json();
+    out.textContent = '已触发，几秒后刷新看队列';
+    setTimeout(() => location.reload(), 2000);
+  } catch (e) {
+    out.textContent = '失败: ' + e;
+  }
+}
+</script>
+{% endblock %}

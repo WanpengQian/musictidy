@@ -1,0 +1,200 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+// 把 public/screenshots/01-*.png ... 取出来按文件名排序展示
+const screenshotModules = import.meta.glob<{ default: string }>(
+  "/public/screenshots/*.{png,jpg,jpeg,webp}",
+  { eager: true }
+);
+const screenshots = Object.keys(screenshotModules)
+  .filter((p) => /\/\d\d-/.test(p))
+  .sort()
+  .map((p) => p.replace("/public", ""));
+---
+<BaseLayout>
+  <!-- ── Hero ── -->
+  <section class="hero" style="border-top:none;">
+    <div class="container">
+      <h1>
+        你买的、你扒的、你攒的<br/>
+        <span class="accent">音乐都该是你的</span>
+      </h1>
+      <p class="sub">
+        MusicTidy 把散落几十年的本地音乐文件整理成一座干净的私有音乐馆 ——
+        跑在自家服务器上，iPhone 上听就跟 Apple Music 一样顺，但所有文件还在你机器里。
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="#demo">在线试用 →</a>
+        <a class="btn btn-ghost" href="/deploy">看部署文档</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 痛点 ── -->
+  <section>
+    <div class="container">
+      <h2>为什么造这个？</h2>
+      <p class="lead">
+        2003 年 Napster 时代攒的 MP3、CD 转的 FLAC、从虾米 / iTunes Store 买的曲子……
+        散落在三块硬盘、几个 NAS、若干网盘里。你想随时听任何一首，但现实是：
+      </p>
+
+      <div class="pain">
+        <div class="pain-card">
+          <h3>流媒体在删你的歌</h3>
+          <p>
+            Spotify 下架了某张专辑、Apple Music 改成了 remix 版、订阅到期"我的音乐"全消失。
+            你以为是租，结果连租约都说没就没。
+          </p>
+        </div>
+        <div class="pain-card">
+          <h3>本地文件是烂摊子</h3>
+          <p>
+            文件名一半乱码、专辑封面缺一半、CUE+APE 分轨包根本播不了、
+            同一首歌在三个目录里以 320k MP3 / FLAC / OGG 各存一份。
+          </p>
+        </div>
+        <div class="pain-card">
+          <h3>跨设备同步是地狱</h3>
+          <p>
+            手机里只能塞下 1/10。iTunes 同步要插线、Plex Music UI 还是 2014 年的、
+            Jellyfin 把音乐当视频的二等公民。
+          </p>
+        </div>
+        <div class="pain-card">
+          <h3>付费方案要么贵要么闭源</h3>
+          <p>
+            Roon 一年 $150 还要 ROCK 主机。商业云盘音乐管家说停就停。
+            你的元数据、播放历史、自己的整理工作，又不是真的属于你。
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 答复 ── -->
+  <section class="solution">
+    <div class="container">
+      <h2>MusicTidy 的答复</h2>
+      <p class="lead">
+        把所有音乐倒进一个目录，剩下交给 MusicTidy：自动 fingerprint 识别每首歌、
+        从 MusicBrainz 抓回准确元数据和专辑封面、规范目录结构、解 RAR / 拆 CUE 分轨、
+        合并跨格式重复。整理完，iOS 客户端连上就能听。
+      </p>
+
+      <div class="solution-grid">
+        <div class="solution-item">
+          <h3>Fingerprint 识别</h3>
+          <p>chromaprint + AcoustID 算每首歌的指纹，对得上 MusicBrainz 就把元数据填回。</p>
+        </div>
+        <div class="solution-item">
+          <h3>自动归档</h3>
+          <p>按 <code>艺人/专辑/曲目</code> 规范化目录，cover.jpg / .cue / .log 等 sidecar 跟着走。</p>
+        </div>
+        <div class="solution-item">
+          <h3>原码 + 转码兼顾</h3>
+          <p>WiFi 直传 FLAC；蜂窝服务器自动转 AAC 192k 省流量；下载长按选码率。</p>
+        </div>
+        <div class="solution-item">
+          <h3>iOS 原生</h3>
+          <p>Swift / SwiftUI 写的，跟 Apple Music 一样的播放体验：锁屏控制、车载、CarPlay、AirPlay。</p>
+        </div>
+        <div class="solution-item">
+          <h3>压缩包友好</h3>
+          <p>RAR/ZIP/7z 自动解（unar，认 GBK / Shift-JIS），CUE+FLAC 自动拆轨，旧资源不再是死文件。</p>
+        </div>
+        <div class="solution-item">
+          <h3>不上传你的数据</h3>
+          <p>App 只连你自己的服务器。MusicBrainz 查询走 server → MB，没有任何遥测进入第三方。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 在线 demo ── -->
+  <section id="demo">
+    <div class="container">
+      <h2>没装服务器？先在线试</h2>
+      <p class="lead">
+        我们维护了一个 demo 实例，里面装了 30 来首公共领域 / CC 授权的音乐 ——
+        Kevin MacLeod、1940 年代上海老唱片、戦前昭和歌謡集。
+        装好 iOS 客户端，配下面这个地址就能用：
+      </p>
+
+      <div class="demo-card">
+        <h3>试 demo</h3>
+        <p>
+          <strong>方法 1：扫码自动填</strong> —— 把下面的二维码截图存到相册，
+          iOS App 启动后在服务器设置页点「扫二维码」选这张照片，三个字段自动填好。
+          密码进登录页时手输。
+        </p>
+        <div class="demo-qr-wrap">
+          <img class="demo-qr" src="/demo-qr.svg" alt="MusicTidy demo server QR code" width="180" height="180" />
+          <div class="demo-fields">
+            <p><strong>方法 2：手输</strong></p>
+            <div class="demo-row">
+              <span class="pill">scheme</span><code>https</code>
+            </div>
+            <div class="demo-row">
+              <span class="pill">host</span><code>demo.musictidy.com</code>
+            </div>
+            <div class="demo-row">
+              <span class="pill">port</span><code>443 (留空即可)</code>
+            </div>
+            <div class="demo-row">
+              <span class="pill">password</span><code>demo2026</code>
+            </div>
+          </div>
+        </div>
+        <p style="margin-top:14px;font-size:14px;">
+          ⚠ demo 每天 04:00 JST 重置，请别把它当持久库用。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 截图 ── -->
+  <section>
+    <div class="container">
+      <h2>App 长什么样</h2>
+      <p class="lead">
+        iPhone 客户端的真实截图（演示从上面那台 demo 服务器拉的内容）：
+      </p>
+      {screenshots.length > 0 ? (
+        <div class="shots">
+          {screenshots.map((src) => (
+            <img src={src} alt="MusicTidy iOS screenshot" loading="lazy" />
+          ))}
+        </div>
+      ) : (
+        <div class="shots-empty">
+          截图待补 —— 把 PNG 放到 <code>site/public/screenshots/01-XX.png</code> ... 就能自动出现在这里。
+        </div>
+      )}
+    </div>
+  </section>
+
+  <!-- ── 怎么自己跑 ── -->
+  <section>
+    <div class="container">
+      <h2>怎么自己跑一份</h2>
+      <p class="lead">
+        服务端是 Python + FastAPI，跑在任何能装 Python 3.11 的盒子上：旧 Mac mini、NAS、廉价 VPS 都行。
+        下面是最短路径，详细见<a href="/deploy">部署文档</a>。
+      </p>
+<pre><code>git clone https://github.com/WanpengQian/MusicTidy.git
+cd MusicTidy/server
+python3.11 -m venv .venv
+.venv/bin/pip install -e .
+echo "APP_PASSWORD=changeme" {'>'} .env
+echo "MUSIC_ROOT=/path/to/your/music" {'>>'} .env
+.venv/bin/python -m app.main
+# 浏览器打开 http://localhost:8765/healthz</code></pre>
+
+      <p style="margin-top:24px;">
+        <a class="btn btn-primary" href="/deploy">完整部署文档 →</a>
+        <a class="btn btn-ghost" href="https://github.com/WanpengQian/MusicTidy" target="_blank" rel="noopener">看源码 ↗</a>
+      </p>
+    </div>
+  </section>
+</BaseLayout>

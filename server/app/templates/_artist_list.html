@@ -1,0 +1,34 @@
+<div id="artist-list" class="artist-list">
+  {% if not artists %}
+    <p class="empty">没有艺人。先 <code>curl -X POST :8765/api/v1/admin/scan</code>。</p>
+  {% endif %}
+
+  {% for a in artists %}
+  <a class="artist-row" href="/artists/{{ a.mbid }}">
+    <div class="artist-row__name">
+      {% if a.name %}
+        <strong>{{ a.name }}</strong>
+        {% if a.country %}<span class="badge">{{ a.country }}</span>{% endif %}
+      {% else %}
+        <strong class="muted">⏳ 加载 discography 中…</strong>
+        <span class="mbid">{{ a.mbid[:8] }}…</span>
+      {% endif %}
+    </div>
+
+    <div class="artist-row__stats">
+      {% if a.total > 0 %}
+        <span class="ratio">{{ a.owned }}/{{ a.total }}</span>
+        <div class="bar">
+          <div class="bar__fill" style="width: {{ (a.completeness or 0) * 100 }}%"></div>
+        </div>
+        <span class="pct">{{ a.completeness | pct }}</span>
+      {% else %}
+        <span class="muted small">
+          {% if a.name %}艺人 MB 有但无 album/EP 记录{% else %}待 MB 拉取{% endif %}
+        </span>
+      {% endif %}
+      <span class="items muted small">{{ a.items_count }} 首在库</span>
+    </div>
+  </a>
+  {% endfor %}
+</div>

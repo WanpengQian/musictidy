@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}规范化归档 — MusicTidy{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1>规范化归档 <span class="muted small">({{ groups|length }} 组待处理)</span></h1>
+  <p class="muted small">
+    按当前源目录分组，每组通常是一张专辑。展开能看到完整的 src → dst 对，
+    包括 cover.jpg / .cue 等 sidecar。点【应用此组】才真动文件，
+    {% if allow_file_writes %}
+    <strong style="color: var(--missing)">⚠ 写入已启用（ALLOW_FILE_WRITES=true）</strong>
+    {% else %}
+    <strong style="color: var(--muted)">写入未启用（.env: ALLOW_FILE_WRITES=false） · 按钮 disabled</strong>
+    {% endif %}
+  </p>
+</section>
+
+{% if not groups %}
+<p class="empty muted">
+  当前没有可归档的专辑。先 <code>curl -X POST :8765/api/v1/admin/scan</code> + <code>identify-unidentified</code>。
+</p>
+{% endif %}
+
+<div class="org-list">
+{% for g in groups %}
+{% set group_id = 'g-' ~ loop.index %}
+<div class="org-group {% if g.all_noop %}org-group--done{% endif %}" id="{{ group_id }}">
+  <header class="org-group__head">
+    <div class="org-group__title">
+      {% if g.all_noop %}
+        <span class="ok small">✓ 已规范</span>
+      {% else %}
+        <span class="badge badge--{{ g.confidence }}">{{ g.confidence_label }}</span>
+      {% endif %}
+      <strong>{{ g.album_artist or '?' }} — {{ g.album or '?' }}</strong>
+      <span class="muted small">({{ g.items_count }} 个音频文件
+        {% set sc = g.moves | rejectattr('kind', 'equalto', 'audio') | list %}
+        {% if sc %}+ {{ sc|length }} sidecar{% endif %})
+      </span>
+    </div>
+    <div class="org-group__actions">
+      <button type="button" class="link-btn" onclick="toggle('{{ group_id }}')">展开 ▾</button>
+      {% if not g.all_noop %}
+      <button class="apply-btn" data-src="{{ g.src_dir }}"
+              {% if not allow_file_writes %}disabled title="ALLOW_FILE_WRITES=false"{% endif %}>
+        应用此组
+      </button>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="org-group__body" hidden>
+    <div class="org-paths">
+      <div><strong>源目录：</strong> <code>{{ g.src_dir_rel }}/</code></div>
+      {% set first_audio = g.moves | selectattr('kind','equalto','audio') | first %}
+      {% if first_audio %}
+      <div><strong>目标目录：</strong>
+        {% set dst_dir = first_audio.dst_rel.rsplit('/', 1)[0] %}
+        <code>{{ dst_dir }}/</code>
+      </div>
+      {% endif %}
+    </div>
+
+    <table class="org-moves">
+      <thead>
+        <tr>
+          <th>类型</th>
+          <th>格式</th>
+          <th class="path-col">源文件</th>
+          <th>→</th>
+          <th class="path-col">归档为</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in g.moves %}
+        <tr class="{% if m.noop %}row--noop{% elif m.kind == 'sidecar' %}row--sidecar{% endif %}">
+          <td>
+            {% if m.kind == 'sidecar' %}<span class="muted small">sidecar</span>
+            {% else %}<span class="small">{{ m.format }}</span>
+            {% endif %}
+          </td>
+          <td>{% if m.bitrate_kbps %}{{ m.bitrate_kbps }}k{% endif %}</td>
+          <td class="path-col"><code>{{ m.src_rel }}</code></td>
+          <td class="muted">{% if m.noop %}=={% else %}→{% endif %}</td>
+          <td class="path-col"><code>{{ m.dst_rel }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if g.leftovers %}
+    <div class="org-leftovers">
+      <strong>⚠ 未归类的文件（不会被 mv）：</strong>
+      <ul>
+        {% for x in g.leftovers %}<li><code>{{ x }}</code></li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if g.src_dir_will_be_empty %}
+    <div class="muted small">✓ 全部归档后，源目录将为空，会被自动删除。</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+</div>
+
+<script>
+function toggle(id){
+  const g = document.getElementById(id);
+  const body = g.querySelector('.org-group__body');
+  const btn = g.querySelector('.link-btn');
+  if (body.hidden){ body.hidden = false; btn.textContent = '收起 ▴'; }
+  else { body.hidden = true; btn.textContent = '展开 ▾'; }
+}
+
+document.querySelectorAll('.apply-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    const src = btn.dataset.src;
+    if (!confirm('确认应用归档？\n源: ' + src)) return;
+    btn.disabled = true;
+    btn.textContent = '处理中…';
+    try {
+      const r = await fetch('/api/v1/organize/apply', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({src_dir: src}),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = '✓ 已归档 ' + data.moved + ' 个';
+        btn.style.background = 'var(--accent-soft)';
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        btn.textContent = '失败';
+        alert('失败: ' + (data.reason || JSON.stringify(data.errors)));
+        btn.disabled = false;
+      }
+    } catch (e) {
+      btn.textContent = '错误';
+      alert(e);
+      btn.disabled = false;
+    }
+  });
+});
+</script>
+{% endblock %}

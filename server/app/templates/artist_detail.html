@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}{{ artist.name or "..." }} — MusicTidy{% endblock %}
+
+{% block content %}
+<section class="artist-head">
+  <a class="back" href="/artists">← 艺人列表</a>
+  {% if artist.name %}
+    <h1>{{ artist.name }}
+      {% if artist.country %}<span class="badge">{{ artist.country }}</span>{% endif %}
+    </h1>
+    {% if artist.disambiguation %}
+      <p class="muted">{{ artist.disambiguation }}</p>
+    {% endif %}
+  {% else %}
+    <h1 class="muted">⏳ discography 加载中…</h1>
+    <p class="muted small">artist mbid: <code>{{ artist.mbid }}</code></p>
+  {% endif %}
+  <p class="muted small">
+    {{ items_in_library }} 首在你库里 ·
+    <a href="https://musicbrainz.org/artist/{{ artist.mbid }}" target="_blank">MB ↗</a>
+  </p>
+</section>
+
+{% set total = release_groups|length %}
+{% set owned = release_groups|selectattr('owned')|list|length %}
+
+<section class="discography">
+  <h2>专辑 <span class="muted small">({{ owned }}/{{ total }} 拥有)</span></h2>
+
+  {% if total == 0 %}
+    {% if artist.name %}
+      <p class="empty muted">MB 没有这个艺人的 release-group 记录。</p>
+    {% else %}
+      <p class="empty muted">discography 还在拉取，几秒后刷新就好。</p>
+    {% endif %}
+  {% endif %}
+
+  <ul class="rg-list">
+    {% for rg in release_groups %}
+    <li class="rg {% if rg.owned %}rg--owned{% else %}rg--missing{% endif %}">
+      <span class="rg__year">{{ rg.first_release_date | year or "—" }}</span>
+      <span class="rg__icon" aria-hidden="true">
+        {% if rg.owned %}✅{% else %}⬚{% endif %}
+      </span>
+      <span class="rg__title">
+        <a href="https://musicbrainz.org/release-group/{{ rg.mbid }}" target="_blank">{{ rg.title }}</a>
+      </span>
+      <span class="rg__type small muted">
+        {{ rg.primary_type }}{% set st = rg.secondary_types | sec_types %}{% if st %} · {{ st }}{% endif %}
+      </span>
+      <span class="rg__items small muted">
+        {% if rg.owned_items > 0 %}{{ rg.owned_items }} 首{% endif %}
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

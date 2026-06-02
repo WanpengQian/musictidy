@@ -1,0 +1,50 @@
+# 运行时数据 —— 永远不入库
+/data/music/
+/data/*.db
+/data/*.db-journal
+/data/*.db-wal
+/data/*.db-shm
+/data/trash/
+/data/transcode_cache/
+/data/covers/
+/data/artist_photos/
+
+# 用户配置
+.env
+.env.*
+!.env.example
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# iOS
+ios/Pods/
+ios/build/
+ios/DerivedData/
+**/xcuserdata/
+**/*.xcuserdatad/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Third-party 源码快照（如有 vendor）
+/third_party/*/
+!/third_party/*.md
