@@ -23,6 +23,7 @@ from app.db import get_engine
 PUBLIC_PATH_PREFIXES = (
     "/login",
     "/api/v1/auth/",
+    "/api/v1/server/logo",   # iOS 登录页加载用，登录前必须能拿
     "/static/",
     "/healthz",
     "/docs",

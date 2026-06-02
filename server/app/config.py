@@ -73,6 +73,18 @@ class Settings(BaseSettings):
     # ── 安全闸 ────────────────────────────────────
     allow_file_writes: bool = False
 
+    # ── 自定义品牌（iOS 登录页展示用）─────────────
+    # 空 = 显示默认 "MusicTidy" + 客户端内置 logo
+    # 设了 = iOS 登录页头部显示你设的名字 / 图，区分多个服务器
+    server_display_name: str = Field(
+        "MusicTidy",
+        description="iOS 登录页显示的服务器名字，默认 'MusicTidy'",
+    )
+    server_logo_path: Path | None = Field(
+        None,
+        description="服务器 logo 图绝对路径（PNG/JPG/SVG）；不设则 iOS 用内置 logo",
+    )
+
     # ── 登录 ──────────────────────────────────────
     # 未设置 → 整个 app 跳过 auth（dev 默认）
     # 设置之后所有 /api/v1/* 和 HTML 路由都要 token（除 /login /static /healthz /docs）

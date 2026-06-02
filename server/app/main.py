@@ -103,6 +103,12 @@ def create_app() -> FastAPI:
     async def healthz():
         # 客户端"测试连接"靠 app 字段确认这是真 MusicTidy 服务器，
         # 而不是随便一个返回 200 的端口
+        #
+        # display_name / logo_url 是品牌字段（iOS 登录页用），无值时 iOS 端
+        # 用默认 "MusicTidy" + 内置 App logo。
+        has_logo = (
+            s.server_logo_path is not None and s.server_logo_path.exists()
+        )
         return {
             "ok": True,
             "app": "MusicTidy",
@@ -111,7 +117,25 @@ def create_app() -> FastAPI:
             "music_root": str(s.music_root),
             "data_dir": str(s.data_dir),
             "allow_file_writes": s.allow_file_writes,
+            "display_name": s.server_display_name,
+            "logo_url": "/api/v1/server/logo" if has_logo else None,
         }
+
+    @app.get("/api/v1/server/logo")
+    async def server_logo():
+        """iOS 登录页拿这张图当 server logo；服务器没配则 404。
+        无需 auth：登录前就要展示，跟 /healthz 一样属于公开标识。
+        """
+        from fastapi.responses import FileResponse  # noqa: PLC0415
+        from fastapi import HTTPException  # noqa: PLC0415
+
+        if s.server_logo_path is None or not s.server_logo_path.exists():
+            raise HTTPException(404, "server logo not configured")
+        return FileResponse(
+            str(s.server_logo_path),
+            # 一天 cache 足够；改 logo 不是热操作
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     return app
 

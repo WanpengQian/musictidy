@@ -48,3 +48,4 @@ ios/DerivedData/
 # Third-party 源码快照（如有 vendor）
 /third_party/*/
 !/third_party/*.md
+.wrangler/

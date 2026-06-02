@@ -20,8 +20,10 @@ const screenshots = Object.keys(screenshotModules)
         <span class="accent">音乐都该是你的</span>
       </h1>
       <p class="sub">
-        MusicTidy 把散落几十年的本地音乐文件整理成一座干净的私有音乐馆 ——
-        跑在自家服务器上，iPhone 上听就跟 Apple Music 一样顺，但所有文件还在你机器里。
+        视频满天飞的时代，我只想<strong>好好听首歌</strong>。
+        MusicTidy 把散落几十年的本地音乐文件整理成一座干净的私有音乐馆，
+        iPhone 上配一个<strong>专注、顺手</strong>的 App —— 没视频、没短视频、没 podcast 推流。
+        <strong>免费</strong>开箱即用，Pro 只是锦上添花。
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="#demo">在线试用 →</a>
@@ -52,6 +54,14 @@ const screenshots = Object.keys(screenshotModules)
           <p>
             文件名一半乱码、专辑封面缺一半、CUE+APE 分轨包根本播不了、
             同一首歌在三个目录里以 320k MP3 / FLAC / OGG 各存一份。
+          </p>
+        </div>
+        <div class="pain-card">
+          <h3>音乐被视频淹没</h3>
+          <p>
+            打开 YouTube Music 推你听演唱会 vlog；Spotify 塞你 video podcast；
+            打开 Apple Music 想随便放首歌，先吃一段 MV。
+            你只是想<strong>听</strong>，不想看任何东西。
           </p>
         </div>
         <div class="pain-card">
@@ -100,12 +110,100 @@ const screenshots = Object.keys(screenshotModules)
           <p>Swift / SwiftUI 写的，跟 Apple Music 一样的播放体验：锁屏控制、车载、CarPlay、AirPlay。</p>
         </div>
         <div class="solution-item">
+          <h3>专注的纯音乐</h3>
+          <p>没视频、没短视频、没 podcast 推荐。打开就是你的曲库 → 选 → 听。一秒钟也不浪费在"建议你看一下"。</p>
+        </div>
+        <div class="solution-item">
           <h3>压缩包友好</h3>
           <p>RAR/ZIP/7z 自动解（unar，认 GBK / Shift-JIS），CUE+FLAC 自动拆轨，旧资源不再是死文件。</p>
         </div>
         <div class="solution-item">
           <h3>不上传你的数据</h3>
           <p>App 只连你自己的服务器。MusicBrainz 查询走 server → MB，没有任何遥测进入第三方。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 你的专属音乐 ── -->
+  <section>
+    <div class="container">
+      <h2>你的<strong>专属</strong>音乐也管用</h2>
+      <p class="lead">
+        老 demo 带、自己录的、小厂牌买的、独立音乐人发的小众专辑……
+        AcoustID 和 MusicBrainz 数据库里<strong>根本没有指纹也没有封面</strong>。
+        别的工具到这里就放弃，你只能盯着一堆"未识别"。
+      </p>
+
+      <div class="unique-grid">
+        <div class="unique-card">
+          <div class="unique-step">1</div>
+          <h3>手动指认 → 写进你自己的库</h3>
+          <p>
+            长按曲目改名字 / 关联到对的专辑 / 上传你手机相册里那张正确封面 / 或在 App 内置浏览器搜 Google 图片，
+            一键带回。你做的每一次决策都进<strong>你自己的 musictidy.db</strong>，不会丢、不会被回滚。
+          </p>
+        </div>
+        <div class="unique-card">
+          <div class="unique-step">2</div>
+          <h3>自动算 chromaprint 存到本地指纹库</h3>
+          <p>
+            就算 AcoustID 查不到，MusicTidy 还是会<strong>本地算出每首歌的 chromaprint 指纹</strong>，
+            打上你刚指认的标签存进自己的指纹库。下次同一段音频出现，直接命中。
+          </p>
+        </div>
+        <div class="unique-card">
+          <div class="unique-step">3</div>
+          <h3>未来你扒新文件，"我是不是已经有了"立刻知道</h3>
+          <p>
+            过几年你又翻出一块老盘 / 朋友 U 盘塞过来一堆 FLAC ——
+            MusicTidy 用<strong>你自己的指纹库</strong>跟新文件比一遍，
+            <strong>同首歌</strong>不论格式（320k MP3 / FLAC / 24bit / ALAC）都能认出来，
+            标重复，让你选保留哪份。
+          </p>
+        </div>
+      </div>
+
+      <p style="margin-top:24px;color:var(--fg-soft);font-size:15px;text-align:center;">
+        你整理的每一分钟，都沉淀成<strong>属于你自己的数据库</strong>。卸载也带得走（就是几个 SQLite 文件）。
+      </p>
+    </div>
+  </section>
+
+  <!-- ── 定价 ── -->
+  <section>
+    <div class="container">
+      <h2>多少钱？</h2>
+      <p class="lead">
+        <strong>免费</strong>。Server 是 MIT 开源你自己跑，iOS 客户端在 App Store 免费下载。
+        装好 + 连上你服务器，就已经是你的私有 Apple Music。
+      </p>
+
+      <div class="pricing-grid">
+        <div class="pricing-card pricing-free">
+          <div class="pricing-label">基础版</div>
+          <div class="pricing-price">免费</div>
+          <ul>
+            <li>艺人 / 专辑 / 曲目浏览 + 搜索</li>
+            <li>原码 + 转码流播放</li>
+            <li>边听边自动缓存（5 GB LRU）</li>
+            <li>多服务器切换 + Face ID 解锁</li>
+            <li>锁屏控制 / 蓝牙 / CarPlay / AirPlay</li>
+            <li>整套 iOS UI 完整可用</li>
+          </ul>
+          <p class="pricing-note">没买 Pro 也能日常一直用，不会被弹窗或灰按钮挡。</p>
+        </div>
+        <div class="pricing-card pricing-pro">
+          <div class="pricing-label">Pro · 可选</div>
+          <div class="pricing-price">一次性买断</div>
+          <ul>
+            <li>整张专辑批量下载（可选码率）</li>
+            <li>自定义专辑封面（手机相册 / Google 搜图）</li>
+            <li>手动指认曲目（找回 AcoustID 误识别）</li>
+            <li>把当前队列保存为命名播放列表</li>
+            <li>支持作者继续开发</li>
+          </ul>
+          <p class="pricing-note">给重度玩家的快捷键。不买不影响"日常听歌"。</p>
         </div>
       </div>
     </div>
