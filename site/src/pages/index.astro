@@ -182,8 +182,8 @@ const screenshots = Object.keys(screenshotModules)
         服务端是 Python + FastAPI，跑在任何能装 Python 3.11 的盒子上：旧 Mac mini、NAS、廉价 VPS 都行。
         下面是最短路径，详细见<a href="/deploy">部署文档</a>。
       </p>
-<pre><code>git clone https://github.com/WanpengQian/MusicTidy.git
-cd MusicTidy/server
+<pre><code>git clone https://github.com/WanpengQian/musictidy.git
+cd musictidy/server
 python3.11 -m venv .venv
 .venv/bin/pip install -e .
 echo "APP_PASSWORD=changeme" {'>'} .env
@@ -193,7 +193,7 @@ echo "MUSIC_ROOT=/path/to/your/music" {'>>'} .env
 
       <p style="margin-top:24px;">
         <a class="btn btn-primary" href="/deploy">完整部署文档 →</a>
-        <a class="btn btn-ghost" href="https://github.com/WanpengQian/MusicTidy" target="_blank" rel="noopener">看源码 ↗</a>
+        <a class="btn btn-ghost" href="https://github.com/WanpengQian/musictidy" target="_blank" rel="noopener">看源码 ↗</a>
       </p>
     </div>
   </section>

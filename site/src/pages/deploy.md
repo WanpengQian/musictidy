@@ -37,8 +37,8 @@ brew install python@3.11 ffmpeg chromaprint unar
 适合自家局域网用，端口直接暴露：
 
 ```bash
-git clone https://github.com/WanpengQian/MusicTidy.git
-cd MusicTidy/server
+git clone https://github.com/WanpengQian/musictidy.git
+cd musictidy/server
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -e .
@@ -213,6 +213,6 @@ sudo systemctl restart musictidy
 | RAR 解压不了 | 系统没装 `unar` / 文件本身坏了（看 `/archives`） |
 | 蜂窝播放卡 | 服务器 CPU 跟不上转码，降 `TRANSCODE_WORKERS` |
 
-更多疑难：[Support](/support) 页或 [GitHub Issues](https://github.com/WanpengQian/MusicTidy/issues)。
+更多疑难：[Support](/support) 页或 [GitHub Issues](https://github.com/WanpengQian/musictidy/issues)。
 
 </article>
