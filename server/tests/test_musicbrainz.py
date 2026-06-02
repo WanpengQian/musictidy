@@ -48,7 +48,7 @@ async def test_fetch_artist_upserts_artist_and_release_groups(env, monkeypatch):
     """Happy path: fetch artist + all release-groups stored."""
 
     def fake_get_artist_by_id(mbid, includes):
-        assert includes == ["release-groups"]
+        assert includes == ["release-groups", "genres", "tags"]
         return FAKE_ARTIST_PAYLOAD
 
     monkeypatch.setattr(musicbrainz.musicbrainzngs, "get_artist_by_id", fake_get_artist_by_id)

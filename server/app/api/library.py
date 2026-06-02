@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path as PPath
 from typing import Any
@@ -1241,6 +1242,102 @@ async def release_group_tracks(mbid: str) -> dict:
         )
     log.info("cached %d tracks for rg=%s", len(tracks_out), mbid)
     return {"release_group_mbid": mbid, "tracks": tracks_out, "from_cache": False}
+
+
+@router.post("/playlist/genre-summary")
+async def playlist_genre_summary(payload: dict) -> dict:
+    """给 iOS 端"按风格搜图"用：传 item_ids，返回聚合后的 top genres + 一个建议
+    的搜图关键词。
+
+    流程：item_ids → 各自的 mb_albumartistid（或 mb_artistid 兜底） → 查
+    mb_artist.genres（已经是 [{name,count}] 排序好的）→ 跨所有艺人投票累加 →
+    挑 top tags → 按 mood 词典套一个"album art" 类的后缀。
+    """
+    item_ids = payload.get("item_ids") or []
+    if not isinstance(item_ids, list) or not item_ids:
+        return {"top_genres": [], "suggested_query": ""}
+
+    placeholders = ",".join(f":i{idx}" for idx in range(len(item_ids)))
+    params = {f"i{idx}": int(v) for idx, v in enumerate(item_ids) if isinstance(v, int)}
+    if not params:
+        return {"top_genres": [], "suggested_query": ""}
+
+    sql = f"""
+        SELECT DISTINCT COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) AS mbid
+        FROM beets.items
+        WHERE id IN ({placeholders})
+          AND COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != ''
+    """
+    with get_engine().connect() as conn:
+        artist_mbids = [r[0] for r in conn.execute(text(sql), params).all()]
+
+        if not artist_mbids:
+            return {"top_genres": [], "suggested_query": ""}
+
+        # 拿这些艺人的 genres JSON
+        a_placeholders = ",".join(f":a{idx}" for idx in range(len(artist_mbids)))
+        a_params = {f"a{idx}": m for idx, m in enumerate(artist_mbids)}
+        rows = conn.execute(
+            text(
+                f"SELECT mbid, genres FROM mb_artist WHERE mbid IN ({a_placeholders})"
+            ),
+            a_params,
+        ).all()
+
+    # 跨艺人投票累加
+    bag: dict[str, int] = {}
+    for _, genres_json in rows:
+        if not genres_json:
+            continue
+        try:
+            tags = json.loads(genres_json)
+        except json.JSONDecodeError:
+            continue
+        for t in tags:
+            name = (t.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                cnt = int(t.get("count") or 1)
+            except (ValueError, TypeError):
+                cnt = 1
+            bag[name] = bag.get(name, 0) + cnt
+
+    if not bag:
+        return {"top_genres": [], "suggested_query": ""}
+
+    top = sorted(bag.items(), key=lambda x: -x[1])[:5]
+    top_names = [n for n, _ in top]
+
+    # 风格 → 搜图后缀
+    bag_text = " ".join(top_names).lower()
+    if any(k in bag_text for k in ("metal", "punk", "hardcore", "industrial",
+                                    "doom", "grindcore")):
+        mood = "intense dark"
+    elif any(k in bag_text for k in ("jazz", "classical", "ambient", "lounge",
+                                      "soundtrack", "bossa")):
+        mood = "minimal elegant"
+    elif any(k in bag_text for k in ("pop", "dance", "electronic", "edm",
+                                      "house", "synth")):
+        mood = "vibrant neon"
+    elif any(k in bag_text for k in ("folk", "country", "acoustic",
+                                      "americana", "bluegrass")):
+        mood = "warm vintage"
+    elif any(k in bag_text for k in ("rock", "indie", "alternative",
+                                      "post-rock")):
+        mood = "moody atmospheric"
+    elif any(k in bag_text for k in ("hip hop", "rap", "trap")):
+        mood = "urban street"
+    else:
+        mood = "aesthetic"
+
+    # 头两个 tag 拼前缀，避免太长
+    query = f"{' '.join(top_names[:2])} {mood} album cover"
+    return {
+        "top_genres": top_names,
+        "suggested_query": query,
+        "artist_mbid_count": len(rows),
+    }
 
 
 @router.post("/items/{item_id}/identify")

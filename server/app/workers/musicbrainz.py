@@ -76,20 +76,44 @@ def _is_fresh(artist_mbid: str) -> bool:
 
 def _upsert_artist(mbid: str, a: dict[str, Any]) -> None:
     now = int(time.time())
+    # 拿 genres + tags 投票数，合并 dedup 后存进 mb_artist.genres
+    # MB 返回结构: {"genre-list": [{"name": "rock", "count": "12"}, ...],
+    #              "tag-list":   [{"name": "alternative rock", "count": "5"}, ...]}
+    bag: dict[str, int] = {}
+    for src_key in ("genre-list", "tag-list"):
+        for item in a.get(src_key) or []:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("name") or "").lower().strip()
+            if not name:
+                continue
+            try:
+                count = int(item.get("count") or 1)
+            except (ValueError, TypeError):
+                count = 1
+            bag[name] = bag.get(name, 0) + count
+    # 按 count 降序，留前 20
+    ranked = sorted(bag.items(), key=lambda x: -x[1])[:20]
+    genres_json = json.dumps(
+        [{"name": n, "count": c} for n, c in ranked],
+        ensure_ascii=False,
+    )
+
     with get_engine().begin() as conn:
         conn.execute(
             text(
                 """INSERT INTO mb_artist
                        (mbid, name, sort_name, country, disambiguation,
-                        fetched_at, stale_after)
-                   VALUES (:m, :n, :s, :c, :d, :f, :sa)
+                        fetched_at, stale_after, genres)
+                   VALUES (:m, :n, :s, :c, :d, :f, :sa, :g)
                    ON CONFLICT(mbid) DO UPDATE SET
                        name=excluded.name,
                        sort_name=excluded.sort_name,
                        country=excluded.country,
                        disambiguation=excluded.disambiguation,
                        fetched_at=excluded.fetched_at,
-                       stale_after=excluded.stale_after"""
+                       stale_after=excluded.stale_after,
+                       genres=excluded.genres"""
             ),
             {
                 "m": mbid,
@@ -99,6 +123,7 @@ def _upsert_artist(mbid: str, a: dict[str, Any]) -> None:
                 "d": a.get("disambiguation") or "",
                 "f": now,
                 "sa": now + WEEK_SEC,
+                "g": genres_json,
             },
         )
 
@@ -263,7 +288,7 @@ async def handle_fetch_artist(payload: dict[str, Any]) -> None:
         data = await _rate_limited(
             musicbrainzngs.get_artist_by_id,
             artist_mbid,
-            includes=["release-groups"],
+            includes=["release-groups", "genres", "tags"],
         )
     except musicbrainzngs.ResponseError as e:
         # 404 / 错的 mbid —— 不重试
