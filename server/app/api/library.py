@@ -96,11 +96,13 @@ async def search_suggest(q: str = "", limit_full: int = 6) -> dict:
         else:
             album_rows = []
 
-        # 曲目前缀匹配（beets）
+        # 曲目前缀匹配（beets）—— 多带 length / bitrate / mb_releasegroupid / mb_trackid
+        # 让 iOS 点了立刻有时长 + 能跳到正确专辑详情
         if q:
             track_rows = conn.execute(
                 text(
-                    """SELECT id, title, artist, album, format
+                    """SELECT id, title, artist, album, format,
+                              length, bitrate, mb_releasegroupid, mb_trackid
                        FROM beets.items
                        WHERE title LIKE :p
                        LIMIT 30"""
@@ -136,8 +138,14 @@ async def search_suggest(q: str = "", limit_full: int = 6) -> dict:
                     f"https://coverartarchive.org/release-group/{r.mbid}/front-500"}
 
     def _serialize_track(r):
-        return {"id": r.id, "title": r.title,
-                "artist": r.artist, "album": r.album, "format": r.format}
+        return {
+            "id": r.id, "title": r.title,
+            "artist": r.artist, "album": r.album, "format": r.format,
+            "length": float(r.length or 0),
+            "bitrate_kbps": int((r.bitrate or 0) // 1000),
+            "mb_releasegroupid": r.mb_releasegroupid or "",
+            "mb_trackid": r.mb_trackid or "",
+        }
 
     return {
         "query": q,
