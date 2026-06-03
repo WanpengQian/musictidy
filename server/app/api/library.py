@@ -900,7 +900,21 @@ async def cover_release_group(mbid: str, size: int):
     if size not in COVER_SIZES:
         raise HTTPException(400, detail="size must be 250 / 500 / 1200")
 
-    # localdir 合成 mbid 没 MB / CAA 记录，直接生成 SVG fallback（用目录名做 label）
+    s = get_settings()
+    s.covers_dir.mkdir(parents=True, exist_ok=True)
+
+    # 用户从手机上传的自定义封面优先（含 localdir 合成 mbid + is_local 都吃这一条）
+    pref = _cover_pref(mbid)
+    if pref == "custom":
+        custom = _custom_cover_path(mbid)
+        if custom is not None:
+            ext = custom.suffix.lower().lstrip(".")
+            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp",
+                    "heic": "image/heic"}.get(ext, "application/octet-stream")
+            return FileResponse(custom, media_type=mime)
+
+    # 没自定义封面 → localdir 合成 mbid 直接 SVG fallback（用目录名做 label）
     if mbid.startswith(_LOCAL_DIR_PREFIX):
         import os  # noqa: PLC0415
         dir_path = _decode_local_album_mbid(mbid) or ""
@@ -925,21 +939,6 @@ async def cover_release_group(mbid: str, size: int):
                 content=svg, media_type="image/svg+xml",
                 headers={"Cache-Control": "public, max-age=86400"},
             )
-
-    s = get_settings()
-    s.covers_dir.mkdir(parents=True, exist_ok=True)
-
-    # 用户从手机上传的自定义封面优先
-    pref = _cover_pref(mbid)
-    if pref == "custom":
-        custom = _custom_cover_path(mbid)
-        if custom is not None:
-            # 所有尺寸都返回同一张原图，让客户端自己缩放
-            ext = custom.suffix.lower().lstrip(".")
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "webp": "image/webp",
-                    "heic": "image/heic"}.get(ext, "application/octet-stream")
-            return FileResponse(custom, media_type=mime)
 
     cache_path = s.covers_dir / f"rg_{mbid}_{size}.jpg"
 
