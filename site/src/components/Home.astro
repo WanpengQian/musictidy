@@ -1,0 +1,185 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { t, type Locale } from "../lib/i18n";
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const tr = (k: string) => t(locale, k);
+
+const screenshotModules = import.meta.glob<{ default: string }>(
+  "/public/screenshots/*.{png,jpg,jpeg,webp}",
+  { eager: true },
+);
+const screenshots = Object.keys(screenshotModules)
+  .filter((p) => /\/\d\d-/.test(p))
+  .sort()
+  .map((p) => p.replace("/public", ""));
+---
+<BaseLayout>
+  <!-- Hero -->
+  <section class="hero" style="border-top:none;">
+    <div class="container">
+      <h1>
+        {tr("hero.headline.line1")}<br/>
+        <span class="accent">{tr("hero.headline.line2")}</span>
+      </h1>
+      <p class="sub" set:html={tr("hero.sub")}></p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://app.musictidy.com" target="_blank" rel="noopener">{tr("hero.ctaPrimary")}</a>
+        <a class="btn btn-ghost" href="/deploy">{tr("hero.ctaGhost")}</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Web app pitch -->
+  <section class="webapp">
+    <div class="container">
+      <h2>{tr("web.title")}</h2>
+      <p class="lead" set:html={tr("web.lead")}></p>
+      <p>
+        <a class="btn btn-primary" href="https://app.musictidy.com" target="_blank" rel="noopener">{tr("web.cta")}</a>
+      </p>
+      <div class="web-grid">
+        <div class="web-card">
+          <h3>{tr("web.featAlbum.title")}</h3>
+          <p>{tr("web.featAlbum.desc")}</p>
+        </div>
+        <div class="web-card">
+          <h3>{tr("web.featPlaylist.title")}</h3>
+          <p>{tr("web.featPlaylist.desc")}</p>
+        </div>
+        <div class="web-card">
+          <h3>{tr("web.featLang.title")}</h3>
+          <p>{tr("web.featLang.desc")}</p>
+        </div>
+        <div class="web-card">
+          <h3>{tr("web.featLocal.title")}</h3>
+          <p>{tr("web.featLocal.desc")}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Pain -->
+  <section>
+    <div class="container">
+      <h2>{tr("pain.title")}</h2>
+      <p class="lead">{tr("pain.lead")}</p>
+      <div class="pain">
+        <div class="pain-card">
+          <h3>{tr("pain1.title")}</h3>
+          <p>{tr("pain1.desc")}</p>
+        </div>
+        <div class="pain-card">
+          <h3>{tr("pain2.title")}</h3>
+          <p>{tr("pain2.desc")}</p>
+        </div>
+        <div class="pain-card">
+          <h3>{tr("pain3.title")}</h3>
+          <p>{tr("pain3.desc")}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Solution -->
+  <section class="solution">
+    <div class="container">
+      <h2>{tr("solution.title")}</h2>
+      <div class="solution-grid">
+        <div class="solution-item">
+          <h3>{tr("solution.serverTitle")}</h3>
+          <p set:html={tr("solution.serverDesc")}></p>
+        </div>
+        <div class="solution-item">
+          <h3>{tr("solution.iosTitle")}</h3>
+          <p set:html={tr("solution.iosDesc")}></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Steps -->
+  <section>
+    <div class="container">
+      <h2>{tr("steps.title")}</h2>
+      <div class="solution-grid">
+        <div class="solution-item">
+          <h3>1 · {tr("steps.s1.title")}</h3>
+          <p>{tr("steps.s1.desc")}</p>
+        </div>
+        <div class="solution-item">
+          <h3>2 · {tr("steps.s2.title")}</h3>
+          <p>{tr("steps.s2.desc")}</p>
+        </div>
+        <div class="solution-item">
+          <h3>3 · {tr("steps.s3.title")}</h3>
+          <p>{tr("steps.s3.desc")}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Screenshots -->
+  {screenshots.length > 0 && (
+    <section>
+      <div class="container">
+        <h2>{tr("shots.title")}</h2>
+        <div class="shots">
+          {screenshots.map((src) => (
+            <img src={src} alt="MusicTidy iOS screenshot" loading="lazy" />
+          ))}
+        </div>
+      </div>
+    </section>
+  )}
+
+  <!-- Demo (web app) -->
+  <section id="demo">
+    <div class="container">
+      <h2>{tr("demo.title")}</h2>
+      <p class="lead" set:html={tr("demo.desc")}></p>
+      <p>
+        <a class="btn btn-primary" href="https://app.musictidy.com" target="_blank" rel="noopener">{tr("demo.go")}</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- Final CTA -->
+  <section class="solution">
+    <div class="container" style="text-align:center;">
+      <h2>{tr("finalCta.title")}</h2>
+      <p class="lead" set:html={tr("finalCta.desc")}></p>
+      <p style="margin-top:24px;">
+        <a class="btn btn-primary" href="/deploy">{tr("finalCta.deploy")}</a>
+        <a class="btn btn-ghost" href="https://github.com/WanpengQian/musictidy" target="_blank" rel="noopener">{tr("finalCta.github")}</a>
+      </p>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .webapp .web-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-top: 24px;
+  }
+  .webapp .web-card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .webapp .web-card h3 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .webapp .web-card p {
+    margin: 0;
+    font-size: 14px;
+    color: var(--fg-soft, #c8c8d8);
+  }
+</style>
