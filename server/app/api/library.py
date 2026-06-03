@@ -900,6 +900,17 @@ async def cover_release_group(mbid: str, size: int):
     if size not in COVER_SIZES:
         raise HTTPException(400, detail="size must be 250 / 500 / 1200")
 
+    # localdir 合成 mbid 没 MB / CAA 记录，直接生成 SVG fallback（用目录名做 label）
+    if mbid.startswith(_LOCAL_DIR_PREFIX):
+        import os  # noqa: PLC0415
+        dir_path = _decode_local_album_mbid(mbid) or ""
+        title = os.path.basename(dir_path) or "?"
+        svg = _generate_fallback_cover(mbid, size, explicit_title=title)
+        return Response(
+            content=svg, media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     s = get_settings()
     s.covers_dir.mkdir(parents=True, exist_ok=True)
 
@@ -965,20 +976,22 @@ async def cover_release_group(mbid: str, size: int):
     return FileResponse(cache_path, media_type="image/jpeg")
 
 
-def _generate_fallback_cover(mbid: str, size: int) -> bytes:
+def _generate_fallback_cover(mbid: str, size: int, *, explicit_title: str = "") -> bytes:
     """没真封面时给 release-group 生成一张 SVG："首字母 + 渐变背景"。
-    色相基于 mbid hash 稳定；标题从 mb_release_group 拿；拿不到就用 ?
+    色相基于 mbid hash 稳定；标题优先 explicit_title (localdir 兜底用)，
+    其次从 mb_release_group 拿；都没有就用 ?
     """
     import hashlib  # noqa: PLC0415
 
-    title = ""
-    with get_engine().connect() as conn:
-        row = conn.execute(
-            text("SELECT title FROM mb_release_group WHERE mbid=:m"),
-            {"m": mbid},
-        ).first()
-        if row:
-            title = (row.title or "").strip()
+    title = (explicit_title or "").strip()
+    if not title:
+        with get_engine().connect() as conn:
+            row = conn.execute(
+                text("SELECT title FROM mb_release_group WHERE mbid=:m"),
+                {"m": mbid},
+            ).first()
+            if row:
+                title = (row.title or "").strip()
 
     label = (title[:2] if title else "?").upper()
 
@@ -1504,6 +1517,82 @@ async def release_group_tracks(mbid: str) -> dict:
     return {"release_group_mbid": mbid, "tracks": tracks_out, "from_cache": False}
 
 
+def _local_dir_playable(mbid: str) -> dict:
+    """localdir-<base64> 合成 mbid 的视图：把同目录的 items 全部当 orphan 返回。
+
+    跟正经 MB 专辑视图共用一个 endpoint，前端不用判断。tracks=[], 全在 orphans。
+    """
+    import os  # noqa: PLC0415
+
+    def _decode(p: object) -> str:
+        if isinstance(p, (bytes, memoryview)):
+            return bytes(p).decode("utf-8", errors="replace")
+        return p or ""
+
+    dir_path = _decode_local_album_mbid(mbid)
+    if not dir_path:
+        raise HTTPException(400, detail="bad local mbid")
+
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT id, path, title, format, bitrate, length,
+                          artist, mb_artistid, mb_albumartistid
+                   FROM beets.items
+                   WHERE CAST(path AS TEXT) LIKE :p"""
+            ),
+            {"p": dir_path.rstrip("/") + "/%"},
+        ).all()
+
+        # 这一坨 items 的代表艺人：取出现最多的 mb_artistid
+        from collections import Counter  # noqa: PLC0415
+        artist_mbids = [
+            (r.mb_albumartistid or r.mb_artistid or "") for r in rows
+        ]
+        artist_mbids = [a for a in artist_mbids if a]
+        artist_mbid = ""
+        artist_name = ""
+        if artist_mbids:
+            artist_mbid = Counter(artist_mbids).most_common(1)[0][0]
+            a = conn.execute(
+                text("SELECT name FROM mb_artist WHERE mbid=:m"),
+                {"m": artist_mbid},
+            ).first()
+            if a:
+                artist_name = a.name or ""
+        if not artist_name:
+            artist_name = next(
+                (r.artist for r in rows if r.artist), ""
+            )
+
+    orphan_items = []
+    for r in rows:
+        path = _decode(r.path)
+        orphan_items.append({
+            "id": int(r.id),
+            "title": r.title or "",
+            "format": (r.format or "").upper(),
+            "bitrate_kbps": int((r.bitrate or 0) // 1000),
+            "length_s": float(r.length or 0),
+            "path": path,
+            "filename": os.path.basename(path),
+        })
+    orphan_items.sort(key=lambda x: x["filename"])
+
+    return {
+        "release_group_mbid": mbid,
+        "title": os.path.basename(dir_path) or "(unknown)",
+        "artist_mbid": artist_mbid,
+        "artist": artist_name,
+        "first_release_date": "",
+        "primary_type": "Local",
+        "tracks": [],
+        "orphan_items": orphan_items,
+        "owned_count": 0,
+        "total_count": 0,
+    }
+
+
 @router.get("/release-groups/{mbid}/playable")
 async def release_group_playable(mbid: str) -> dict:
     """MB-driven 专辑视图：返回 canonical MB 曲目表，每首附 bound_item（自动选的最佳本地副本）+ alternatives_count。
@@ -1514,7 +1603,12 @@ async def release_group_playable(mbid: str) -> dict:
     bound_item 自动选规则：
       1. 同 recording_mbid 的 items 里
       2. 优先 lossless/原文件（FLAC > WAV > APE 等），其次按 bitrate 高的
+
+    localdir-<base64> 这种合成 mbid 走兜底分支，返回纯 orphan 视图。
     """
+    if mbid.startswith(_LOCAL_DIR_PREFIX):
+        return _local_dir_playable(mbid)
+
     import json  # noqa: PLC0415
 
     # 复用 tracks endpoint 的缓存逻辑：先从 mb_release_group.tracks_json 拿
@@ -1908,14 +2002,49 @@ async def get_release_group(mbid: str) -> dict:
     return d
 
 
+_LOCAL_DIR_PREFIX = "localdir-"
+
+
+def _synth_local_album_mbid(dir_path: str) -> str:
+    import base64  # noqa: PLC0415
+    return _LOCAL_DIR_PREFIX + base64.urlsafe_b64encode(
+        dir_path.encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_local_album_mbid(mbid: str) -> str | None:
+    if not mbid.startswith(_LOCAL_DIR_PREFIX):
+        return None
+    import base64  # noqa: PLC0415
+    raw = mbid[len(_LOCAL_DIR_PREFIX):]
+    pad = "=" * (-len(raw) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw + pad).decode("utf-8")
+    except Exception:
+        return None
+
+
 @router.get("/artists/{mbid}/owned-albums")
 async def owned_albums(mbid: str) -> dict:
-    """给 iOS Browse 用：返回此艺人参与的所有 release-group（带封面 URL）.
+    """给 Browse 用：返回此艺人参与的所有 release-group（带封面 URL）.
 
     "参与" = RG 本身就归这个艺人 (artist_mbid 匹配)，或者用户库里有这首
     歌的 albumartist/artist 是这个艺人 —— 合辑/OST 这类多艺人专辑能在每个
     参与艺人的 Browse 页都出现。
+
+    末尾再追加"本地兜底"专辑：mb_releasegroupid 为空但 artist 是这位的
+    items，按主文件夹聚合成虚拟专辑，mbid 用 'localdir-<base64(dir)>'
+    格式编码。前端走同一套 /playable/{mbid}，server 端识别 prefix 后
+    返回纯 orphan 视图。这样用户能至少看到那些 fingerprint 没识别的专辑。
     """
+    import os  # noqa: PLC0415
+    from collections import defaultdict  # noqa: PLC0415
+
+    def _decode_path(p: object) -> str:
+        if isinstance(p, (bytes, memoryview)):
+            return bytes(p).decode("utf-8", errors="replace")
+        return p or ""
+
     with get_engine().connect() as conn:
         rgs = conn.execute(
             text(
@@ -1937,10 +2066,47 @@ async def owned_albums(mbid: str) -> dict:
             ),
             {"m": mbid},
         ).all()
-        result = []
+        result: list[dict] = []
         for r in rgs:
             d = dict(r._mapping)
             d["cover_url"] = d.get("cover_url") or \
                 f"https://coverartarchive.org/release-group/{d['mbid']}/front-500"
+            d["is_local"] = False
             result.append(d)
-        return {"count": len(result), "albums": result}
+
+        # —— 本地兜底：artist 命中、但 release-group 没识别的 items ——
+        local_items = conn.execute(
+            text(
+                """SELECT id, path, album
+                   FROM beets.items
+                   WHERE COALESCE(NULLIF(mb_albumartistid, ''),
+                                  mb_artistid) = :m
+                     AND (mb_releasegroupid IS NULL OR mb_releasegroupid = '')"""
+            ),
+            {"m": mbid},
+        ).all()
+
+    by_dir: dict[str, list[Any]] = defaultdict(list)
+    for r in local_items:
+        p = _decode_path(r.path)
+        if not p:
+            continue
+        d = os.path.dirname(p)
+        if d:
+            by_dir[d].append(r)
+
+    for d, its in sorted(by_dir.items()):
+        title = os.path.basename(d) or "(unknown)"
+        synth = _synth_local_album_mbid(d)
+        result.append({
+            "mbid": synth,
+            "title": title,
+            "primary_type": "",
+            "secondary_types": "",
+            "first_release_date": "",
+            "cover_url": f"/api/v1/covers/release-group/{synth}/500",
+            "owned_items": len(its),
+            "is_local": True,
+        })
+
+    return {"count": len(result), "albums": result}
