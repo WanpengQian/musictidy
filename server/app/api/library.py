@@ -1110,6 +1110,44 @@ def _range_response(data: bytes, mime: str, range_header: str | None) -> Respons
     )
 
 
+@router.delete("/local-albums/{mbid}")
+async def delete_local_album(mbid: str) -> dict:
+    """删一张 is_local=1 的本地策划专辑。安全限制：
+      - 必须是 is_local=1（拒绝删 MB 缓存的真专辑）
+      - 该 rg 下还有 items 绑着 → 拒绝（避免误删导致 orphan）
+
+    需要强删（连带把 items 摘出来）时调 ?force=1，server 端会先把 items 的
+    mb_releasegroupid 清空，再删 rg。
+    """
+    if not mbid:
+        raise HTTPException(400, detail="mbid required")
+
+    with get_engine().begin() as conn:
+        row = conn.execute(
+            text("SELECT mbid, COALESCE(is_local, 0) AS is_local FROM mb_release_group WHERE mbid=:m"),
+            {"m": mbid},
+        ).first()
+        if not row:
+            raise HTTPException(404, detail="release-group not found")
+        if not (row.is_local or 0):
+            raise HTTPException(
+                400, detail="refuse to delete a non-local release-group (only is_local=1 can be deleted)"
+            )
+        # 还有 items 绑着就拒
+        item_count = conn.execute(
+            text("SELECT COUNT(*) FROM beets.items WHERE mb_releasegroupid = :m"),
+            {"m": mbid},
+        ).scalar() or 0
+        if int(item_count) > 0:
+            raise HTTPException(
+                409,
+                detail=f"refuse: {item_count} item(s) still bound to this release-group; unbind first",
+            )
+        conn.execute(text("DELETE FROM mb_release_group WHERE mbid=:m"), {"m": mbid})
+
+    return {"ok": True, "deleted": mbid}
+
+
 @router.post("/local-albums")
 async def create_local_album(payload: dict) -> dict:
     """新建一张本地策划专辑 (MB 上没收录的) —— 写入 mb_release_group 表，is_local=1。
@@ -1829,7 +1867,8 @@ async def release_group_playable(mbid: str) -> dict:
         rg_row = conn.execute(
             text(
                 """SELECT mbid, title, primary_type, first_release_date,
-                          artist_mbid, tracks_json
+                          artist_mbid, tracks_json,
+                          COALESCE(is_local, 0) AS is_local
                    FROM mb_release_group WHERE mbid=:m"""
             ),
             {"m": mbid},
@@ -1979,6 +2018,7 @@ async def release_group_playable(mbid: str) -> dict:
         "orphan_items": orphan_items,
         "owned_count": sum(1 for t in tracks_out if t["bound_item"]),
         "total_count": len(tracks_out),
+        "is_local": bool(rg.get("is_local") or 0),
     }
 
 
@@ -2265,6 +2305,12 @@ async def owned_albums(mbid: str) -> dict:
         has_is_local = "is_local" in cols
         is_local_sel = "rg.is_local" if has_is_local else "0 AS is_local"
         # rg.artist_mbid 直接关联当前艺人时也算
+        # is_local 专辑哪怕还没绑 item 也算这位艺人的（用户刚建的空壳要能看到）；
+        # 真 MB 专辑必须有 item 命中才进列表
+        if has_is_local:
+            artist_only_clause = "OR (rg.is_local = 1 AND rg.artist_mbid = :m)"
+        else:
+            artist_only_clause = ""
         rgs = conn.execute(
             text(
                 f"""SELECT
@@ -2281,7 +2327,7 @@ async def owned_albums(mbid: str) -> dict:
                                     OR COALESCE(NULLIF(i.mb_albumartistid, ''),
                                                 i.mb_artistid) = :m)
                          )
-                      OR rg.artist_mbid = :m
+                      {artist_only_clause}
                    ORDER BY rg.first_release_date IS NULL,
                             rg.first_release_date"""
             ),
