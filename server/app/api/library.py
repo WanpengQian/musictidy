@@ -1375,6 +1375,13 @@ async def release_group_playable(mbid: str) -> dict:
             ),
             {"rg": mbid},
         ).all()
+        # MB canonical recording mbid 集合 —— 只有真的在 MB 曲目表里的 mb_trackid
+        # 才算 "bound"。MB 拉不到的合成专辑、给错 mb_trackid 的本地文件，
+        # 这里都视为未匹配，能进 orphan 列表
+        mb_recording_set = {
+            t.get("recording_mbid", "") for t in mb_tracks if t.get("recording_mbid")
+        }
+
         by_recording: dict[str, list[dict]] = {}
         bound_ids: set[int] = set()
         item_dirs: list[str] = []
@@ -1394,7 +1401,9 @@ async def release_group_playable(mbid: str) -> dict:
                 "path": path,
             }
             by_recording.setdefault(rec, []).append(cand)
-            bound_ids.add(int(r.id))
+            # 只有 mb_trackid 在 MB canonical 曲目里时才算真的 "bound"；否则当 orphan
+            if rec in mb_recording_set:
+                bound_ids.add(int(r.id))
 
         # 找这张专辑 items 的"主文件夹"（出现次数最多的 dir） —— 用户的
         # 文件一般按 album 一个文件夹放，"同文件夹未识别"的就是漏匹的歌
