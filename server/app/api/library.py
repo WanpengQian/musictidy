@@ -911,6 +911,21 @@ async def cover_release_group(mbid: str, size: int):
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    # is_local 专辑同样跳过 CAA，用存的标题生成 SVG
+    with get_engine().connect() as _c:
+        _row = _c.execute(
+            text("SELECT is_local, title FROM mb_release_group WHERE mbid=:m"),
+            {"m": mbid},
+        ).first()
+        if _row and (_row.is_local or 0):
+            svg = _generate_fallback_cover(
+                mbid, size, explicit_title=(_row.title or "?")
+            )
+            return Response(
+                content=svg, media_type="image/svg+xml",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
     s = get_settings()
     s.covers_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1093,6 +1108,129 @@ def _range_response(data: bytes, mime: str, range_header: str | None) -> Respons
             "Content-Length": str(len(chunk)),
         },
     )
+
+
+@router.post("/local-albums")
+async def create_local_album(payload: dict) -> dict:
+    """新建一张本地策划专辑 (MB 上没收录的) —— 写入 mb_release_group 表，is_local=1。
+
+    payload:
+      - title: str (必填)
+      - artist_name: str (artist_mbid 没填时显示名)
+      - artist_mbid: str (可选，知道艺人 MB id 就填，能跟艺人页关联上)
+      - primary_type: 'Album' | 'Single' | 'EP' | ... (可选)
+      - first_release_date: 'YYYY' | 'YYYY-MM-DD' (可选)
+      - tracks: [{ title: str, length_s?: float, position?: int, disc?: int }]
+        position 不传时按数组顺序 1..N
+
+    tracks 里每首生成一个 uuid4 作为 recording_mbid，跟 MB 真 uuid 同格式，
+    items 后续通过 drag-bind 把自己的 mb_trackid 设成这些 synth id。
+    """
+    import json  # noqa: PLC0415
+    import uuid  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, detail="title required")
+    artist_name = (payload.get("artist_name") or "").strip()
+    artist_mbid = (payload.get("artist_mbid") or "").strip()
+    primary_type = (payload.get("primary_type") or "Album").strip()
+    first_release_date = (payload.get("first_release_date") or "").strip()
+    tracks_in = payload.get("tracks") or []
+    if not isinstance(tracks_in, list) or not tracks_in:
+        raise HTTPException(400, detail="tracks required (non-empty list)")
+
+    tracks_out: list[dict] = []
+    for i, t in enumerate(tracks_in):
+        if not isinstance(t, dict):
+            continue
+        ttitle = (t.get("title") or "").strip()
+        if not ttitle:
+            continue
+        tracks_out.append({
+            "disc": int(t.get("disc", 1) or 1),
+            "position": int(t.get("position") or (i + 1)),
+            "recording_mbid": str(uuid.uuid4()),
+            "title": ttitle,
+            "length_s": float(t.get("length_s") or 0),
+        })
+    if not tracks_out:
+        raise HTTPException(400, detail="tracks must contain at least one title")
+
+    rg_mbid = str(uuid.uuid4())
+    now = int(time.time())
+
+    # 没指定 artist_mbid 时给一个稳定的"未知本地艺人"sentinel，并确保 mb_artist 表里有
+    UNKNOWN_LOCAL_ARTIST_MBID = "00000000-0000-0000-0000-000000000000"
+
+    with get_engine().begin() as conn:
+        # 兜底：旧库可能还没有 is_local/artist_name 列
+        cols = {r[1] for r in conn.execute(
+            text("PRAGMA table_info(mb_release_group)")
+        ).all()}
+        if "is_local" not in cols:
+            conn.execute(text(
+                "ALTER TABLE mb_release_group ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0"
+            ))
+        if "artist_name" not in cols:
+            conn.execute(text(
+                "ALTER TABLE mb_release_group ADD COLUMN artist_name TEXT NOT NULL DEFAULT ''"
+            ))
+        if "tracks_json" not in cols:
+            conn.execute(text(
+                "ALTER TABLE mb_release_group ADD COLUMN tracks_json TEXT"
+            ))
+
+        # 满足 FK：artist_mbid 必须在 mb_artist 里有一行
+        effective_artist_mbid = artist_mbid or UNKNOWN_LOCAL_ARTIST_MBID
+        exists = conn.execute(
+            text("SELECT 1 FROM mb_artist WHERE mbid=:m"),
+            {"m": effective_artist_mbid},
+        ).first()
+        if not exists:
+            conn.execute(
+                text(
+                    """INSERT INTO mb_artist
+                       (mbid, name, sort_name, fetched_at, stale_after)
+                       VALUES (:m, :n, :n, :now, :stale)"""
+                ),
+                {
+                    "m": effective_artist_mbid,
+                    "n": artist_name or "(unknown)",
+                    "now": now,
+                    "stale": now + 86400 * 365 * 10,  # 这种 sentinel/local 艺人不去刷
+                },
+            )
+
+        conn.execute(
+            text(
+                """INSERT INTO mb_release_group
+                   (mbid, title, primary_type, first_release_date,
+                    artist_mbid, artist_name, tracks_json, is_local)
+                   VALUES (:mbid, :title, :pt, :frd, :am, :an, :tj, 1)"""
+            ),
+            {
+                "mbid": rg_mbid,
+                "title": title,
+                "pt": primary_type,
+                "frd": first_release_date,
+                "am": effective_artist_mbid,
+                "an": artist_name,
+                "tj": json.dumps(tracks_out, ensure_ascii=False),
+            },
+        )
+
+    return {
+        "mbid": rg_mbid,
+        "title": title,
+        "artist_mbid": artist_mbid,
+        "artist": artist_name,
+        "primary_type": primary_type,
+        "first_release_date": first_release_date,
+        "tracks": tracks_out,
+        "is_local": True,
+    }
 
 
 @router.post("/local-albums/{local_mbid}/bind-to-mb")
@@ -2120,21 +2258,30 @@ async def owned_albums(mbid: str) -> dict:
         return p or ""
 
     with get_engine().connect() as conn:
+        # 兜底：is_local 列可能还没 migrate（仅查询时手动 add 一次，写过的版本会从下次开始稳定 SELECT）
+        cols = {r[1] for r in conn.execute(
+            text("PRAGMA table_info(mb_release_group)")
+        ).all()}
+        has_is_local = "is_local" in cols
+        is_local_sel = "rg.is_local" if has_is_local else "0 AS is_local"
+        # rg.artist_mbid 直接关联当前艺人时也算
         rgs = conn.execute(
             text(
-                """SELECT
+                f"""SELECT
                        rg.mbid, rg.title, rg.primary_type, rg.secondary_types,
                        rg.first_release_date, rg.cover_url,
                        (SELECT COUNT(*) FROM beets.items i
-                        WHERE i.mb_releasegroupid = rg.mbid) AS owned_items
+                        WHERE i.mb_releasegroupid = rg.mbid) AS owned_items,
+                       {is_local_sel}
                    FROM mb_release_group rg
                    WHERE EXISTS (
-                       SELECT 1 FROM beets.items i
-                       WHERE i.mb_releasegroupid = rg.mbid
-                         AND (rg.artist_mbid = :m
-                              OR COALESCE(NULLIF(i.mb_albumartistid, ''),
-                                          i.mb_artistid) = :m)
-                   )
+                             SELECT 1 FROM beets.items i
+                             WHERE i.mb_releasegroupid = rg.mbid
+                               AND (rg.artist_mbid = :m
+                                    OR COALESCE(NULLIF(i.mb_albumartistid, ''),
+                                                i.mb_artistid) = :m)
+                         )
+                      OR rg.artist_mbid = :m
                    ORDER BY rg.first_release_date IS NULL,
                             rg.first_release_date"""
             ),
@@ -2143,9 +2290,14 @@ async def owned_albums(mbid: str) -> dict:
         result: list[dict] = []
         for r in rgs:
             d = dict(r._mapping)
-            d["cover_url"] = d.get("cover_url") or \
-                f"https://coverartarchive.org/release-group/{d['mbid']}/front-500"
-            d["is_local"] = False
+            is_local_flag = bool(d.get("is_local") or 0)
+            d["is_local"] = is_local_flag
+            if is_local_flag:
+                # 本地策划专辑没 CAA 封面，前端直接走我们的 cover endpoint 拿 SVG
+                d["cover_url"] = f"/api/v1/covers/release-group/{d['mbid']}/500"
+            else:
+                d["cover_url"] = d.get("cover_url") or \
+                    f"https://coverartarchive.org/release-group/{d['mbid']}/front-500"
             result.append(d)
 
         # —— 本地兜底：artist 命中、但 release-group 没识别的 items ——
