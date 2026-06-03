@@ -1412,12 +1412,13 @@ async def release_group_playable(mbid: str) -> dict:
             from collections import Counter  # noqa: PLC0415
             main_dir = Counter(item_dirs).most_common(1)[0][0]
             # 拉同文件夹下所有 items（含没绑到这张 rg 的）
+            # beets items.path 是 BLOB；SQLite LIKE 对 BLOB 不生效，要 CAST 成 TEXT
             folder_rows = conn.execute(
                 text(
                     """SELECT id, mb_releasegroupid, mb_trackid, title, format,
                               bitrate, length, path
                        FROM beets.items
-                       WHERE path LIKE :p"""
+                       WHERE CAST(path AS TEXT) LIKE :p"""
                 ),
                 {"p": main_dir.rstrip("/") + "/%"},
             ).all()
