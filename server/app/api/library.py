@@ -2449,6 +2449,7 @@ async def owned_albums(mbid: str) -> dict:
                 "cover_url": f"/api/v1/covers/release-group/{synth}/500",
                 "owned_items": len(its),
                 "is_local": True,
+                "total_tracks": len(its),
             })
         return {"count": len(result_orphan), "albums": result_orphan}
 
@@ -2466,11 +2467,13 @@ async def owned_albums(mbid: str) -> dict:
             artist_only_clause = "OR (rg.is_local = 1 AND rg.artist_mbid = :m)"
         else:
             artist_only_clause = ""
+        # 多带一个 tracks_json，前端能算 'total_tracks' 决定是不是完整
         rgs = conn.execute(
             text(
                 f"""SELECT
                        rg.mbid, rg.title, rg.primary_type, rg.secondary_types,
                        rg.first_release_date, rg.cover_url,
+                       rg.tracks_json,
                        (SELECT COUNT(*) FROM beets.items i
                         WHERE i.mb_releasegroupid = rg.mbid) AS owned_items,
                        {is_local_sel}
@@ -2493,6 +2496,18 @@ async def owned_albums(mbid: str) -> dict:
             d = dict(r._mapping)
             is_local_flag = bool(d.get("is_local") or 0)
             d["is_local"] = is_local_flag
+            # 算 total_tracks：tracks_json 拉到了就 len(json) 当 canonical 数,
+            # 没拉到就 None (前端别判完整 / 不完整)
+            tj = d.pop("tracks_json", None)
+            total = None
+            if tj:
+                try:
+                    parsed = json.loads(tj)
+                    if isinstance(parsed, list):
+                        total = len(parsed)
+                except (TypeError, ValueError):
+                    total = None
+            d["total_tracks"] = total
             if is_local_flag:
                 # 本地策划专辑没 CAA 封面，前端直接走我们的 cover endpoint 拿 SVG
                 d["cover_url"] = f"/api/v1/covers/release-group/{d['mbid']}/500"
@@ -2534,6 +2549,7 @@ async def owned_albums(mbid: str) -> dict:
             "cover_url": f"/api/v1/covers/release-group/{synth}/500",
             "owned_items": len(its),
             "is_local": True,
+            "total_tracks": len(its),  # localdir 本地兜底视图: 拥有的就是全部
         })
 
     return {"count": len(result), "albums": result}
