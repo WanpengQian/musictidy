@@ -1387,6 +1387,41 @@ async def bind_item(item_id: int, payload: dict) -> dict:
     }
 
 
+@router.post("/release-groups/{mbid}/clear-items")
+async def clear_release_group_items(mbid: str) -> dict:
+    """把所有绑到这张 release-group 的 items 一键摘下来 (mb_trackid + mb_releasegroupid 清空)。
+
+    场景：fingerprint 把同目录一堆文件全错认到一张幻影 MB 专辑上 (典型：
+    女子十二的'魅力音乐会'识别成另一张专辑)。逐首 ✕ 解绑太累，这个直接清掉。
+
+    不删 rg 行（is_local 才允许 DELETE）。items 摘干净后这张 MB album 自然
+    从艺人页消失 (owned_albums 的 EXISTS 没人命中了)。文件不动。
+    """
+    if not mbid:
+        raise HTTPException(400, detail="mbid required")
+
+    from app import beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text("SELECT id FROM beets.items WHERE mb_releasegroupid = :m"),
+            {"m": mbid},
+        ).all()
+    if not rows:
+        return {"ok": True, "mbid": mbid, "unbound_items": 0}
+
+    s = get_settings()
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+    unbound = 0
+    for r in rows:
+        if beets_bridge.set_item_meta(
+            lib, int(r.id), track_mbid="", releasegroup_mbid=""
+        ):
+            unbound += 1
+    return {"ok": True, "mbid": mbid, "unbound_items": unbound}
+
+
 @router.post("/items/{item_id}/unbind")
 async def unbind_item(item_id: int) -> dict:
     """清掉 item 的 mb_trackid + mb_releasegroupid。
