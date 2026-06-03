@@ -316,6 +316,11 @@ def _list_duplicate_groups() -> list[dict[str, Any]]:
 
 
 PLAYABLE_EXTS = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".aiff", ".alac"}
+
+# 浏览器 HTML5 <audio> 普遍能直放的格式 —— 这些走原码不转码省一笔 CPU + 转码缓存。
+# FLAC / WAV / AIFF 虽然现代浏览器也支持，但体积巨大（FLAC 单曲 30+MB / WAV 更大），
+# 走 AAC 192k 转码更经济，所以不放这里。
+BROWSER_NATIVE_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus"}
 MIME_BY_EXT = {
     ".mp3": "audio/mpeg",
     ".flac": "audio/flac",
@@ -998,6 +1003,19 @@ async def stream_item(
 
     # 客户端要 AAC（蜂窝省流量）
     if fmt.lower() == "aac":
+        bitrate = q if q > 0 else s.default_aac_bitrate
+        try:
+            data, mime = await get_or_transcode_aac(item_id, p, bitrate)
+        except RuntimeError as e:
+            raise HTTPException(500, detail=f"transcode failed: {e}") from e
+        return _range_response(data, mime, range_header)
+
+    # 中间层 fmt=auto：浏览器友好。MP3/M4A/AAC/OGG/Opus 原码直送，
+    # FLAC/WAV/AIFF/ALAC + APE/WV/TAK/TTA 一律 AAC 192k。
+    # iOS app 不要传 auto，它有自己的本地解码器。
+    if fmt.lower() == "auto":
+        if ext in BROWSER_NATIVE_EXTS:
+            return FileResponse(p, media_type=MIME_BY_EXT.get(ext, "application/octet-stream"))
         bitrate = q if q > 0 else s.default_aac_bitrate
         try:
             data, mime = await get_or_transcode_aac(item_id, p, bitrate)
