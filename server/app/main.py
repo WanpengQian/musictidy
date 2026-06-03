@@ -112,12 +112,13 @@ def create_app() -> FastAPI:
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     # JSON API
-    from app.api import admin, auth as auth_api, library, playlist  # noqa: PLC0415
+    from app.api import admin, auth as auth_api, library, playlist, wishlist  # noqa: PLC0415
 
     app.include_router(auth_api.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
     app.include_router(library.router, prefix="/api/v1", tags=["library"])
     app.include_router(playlist.router, prefix="/api/v1", tags=["playlist"])
+    app.include_router(wishlist.router, prefix="/api/v1", tags=["wishlist"])
 
     # HTML 路由（dashboard）
     from app.api import web  # noqa: PLC0415
