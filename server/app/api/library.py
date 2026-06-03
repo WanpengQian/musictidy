@@ -1095,6 +1095,80 @@ def _range_response(data: bytes, mime: str, range_header: str | None) -> Respons
     )
 
 
+@router.post("/local-albums/{local_mbid}/bind-to-mb")
+async def bind_local_album_to_mb(local_mbid: str, payload: dict) -> dict:
+    """把一个 localdir-... 合成专辑里所有 items 的 mb_releasegroupid 一次性
+    设成真正的 MB release-group。
+
+    body: { "rg_mbid": "<uuid>" } 也接受贴 MB URL，前端清洗后送 uuid 过来。
+
+    顺手做两件事：
+      - 确保 mb_release_group 缓存表里有这张 rg（调 release_group_tracks
+        触发拉 MB + 缓存 tracks_json）
+      - 把 items.mb_artistid 也写上（如果 rg 知道 artist_mbid 且 items 那
+        一列是空）
+
+    完成后这个 localdir 合成专辑就消失了（items 都不再属于"空 mb_releasegroupid"），
+    用户访问 /release-groups/{rg_mbid}/playable 走正常路径，单曲还得用拖拽
+    绑 mb_trackid。
+    """
+    import re  # noqa: PLC0415
+
+    if not local_mbid.startswith(_LOCAL_DIR_PREFIX):
+        raise HTTPException(400, detail="not a local album mbid")
+    dir_path = _decode_local_album_mbid(local_mbid)
+    if not dir_path:
+        raise HTTPException(400, detail="bad local mbid")
+
+    rg_raw = (payload.get("rg_mbid") or "").strip()
+    m = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        rg_raw, re.IGNORECASE,
+    )
+    if not m:
+        raise HTTPException(400, detail="rg_mbid required (UUID or MB URL)")
+    rg_mbid = m.group(0).lower()
+
+    # 先把 mb_release_group 缓存拉上（顺便能拿到 artist_mbid）
+    try:
+        await release_group_tracks(rg_mbid)
+    except HTTPException:
+        pass  # 拉不到也不阻塞 binding；前端进去就是空 tracks + orphan
+
+    with get_engine().connect() as conn:
+        head = conn.execute(
+            text("SELECT artist_mbid FROM mb_release_group WHERE mbid=:m"),
+            {"m": rg_mbid},
+        ).first()
+        new_artist_mbid = (head.artist_mbid or "") if head else ""
+
+    # 把目录下所有 items 的 mb_releasegroupid 设掉
+    from app import beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT id, mb_artistid FROM beets.items
+                   WHERE CAST(path AS TEXT) LIKE :p"""
+            ),
+            {"p": dir_path.rstrip("/") + "/%"},
+        ).all()
+
+    updated = 0
+    for r in rows:
+        kwargs = {"releasegroup_mbid": rg_mbid}
+        if new_artist_mbid and not (r.mb_artistid or ""):
+            kwargs["artist_mbid"] = new_artist_mbid
+        if beets_bridge.set_item_meta(lib, int(r.id), **kwargs):
+            updated += 1
+
+    return {"ok": True, "rg_mbid": rg_mbid, "updated_items": updated}
+
+
 @router.post("/items/{item_id}/bind")
 async def bind_item(item_id: int, payload: dict) -> dict:
     """把一首本地 item 绑到指定 MB recording + release-group。
