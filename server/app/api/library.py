@@ -1112,17 +1112,23 @@ def _range_response(data: bytes, mime: str, range_header: str | None) -> Respons
 
 @router.delete("/local-albums/{mbid}")
 async def delete_local_album(mbid: str) -> dict:
-    """删一张 is_local=1 的本地策划专辑。安全限制：
-      - 必须是 is_local=1（拒绝删 MB 缓存的真专辑）
-      - 该 rg 下还有 items 绑着 → 拒绝（避免误删导致 orphan）
+    """删一张 is_local=1 的本地策划专辑。
 
-    需要强删（连带把 items 摘出来）时调 ?force=1，server 端会先把 items 的
-    mb_releasegroupid 清空，再删 rg。
+    流程：
+      1. 检查是 is_local=1（拒绝删 MB 缓存的真专辑）
+      2. 把还绑在这张 rg 上的 items 全部清掉 mb_releasegroupid + mb_trackid，
+         它们退回 localdir 兜底视图，文件本身不删
+      3. DELETE mb_release_group 行
+
+    用户场景：创建错了想撤回。文件还在硬盘上，目录视图也还在。
     """
     if not mbid:
         raise HTTPException(400, detail="mbid required")
 
-    with get_engine().begin() as conn:
+    from app import beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    with get_engine().connect() as conn:
         row = conn.execute(
             text("SELECT mbid, COALESCE(is_local, 0) AS is_local FROM mb_release_group WHERE mbid=:m"),
             {"m": mbid},
@@ -1133,19 +1139,26 @@ async def delete_local_album(mbid: str) -> dict:
             raise HTTPException(
                 400, detail="refuse to delete a non-local release-group (only is_local=1 can be deleted)"
             )
-        # 还有 items 绑着就拒
-        item_count = conn.execute(
-            text("SELECT COUNT(*) FROM beets.items WHERE mb_releasegroupid = :m"),
+        # 拉绑在这张上的所有 items，准备清
+        bound = conn.execute(
+            text("SELECT id FROM beets.items WHERE mb_releasegroupid = :m"),
             {"m": mbid},
-        ).scalar() or 0
-        if int(item_count) > 0:
-            raise HTTPException(
-                409,
-                detail=f"refuse: {item_count} item(s) still bound to this release-group; unbind first",
-            )
+        ).all()
+
+    # 通过 beets API 清 items 元数据（直接 SQL UPDATE 也行，但走 bridge 跟 bind 路径一致）
+    s = get_settings()
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+    unbound = 0
+    for r in bound:
+        if beets_bridge.set_item_meta(
+            lib, int(r.id), track_mbid="", releasegroup_mbid=""
+        ):
+            unbound += 1
+
+    with get_engine().begin() as conn:
         conn.execute(text("DELETE FROM mb_release_group WHERE mbid=:m"), {"m": mbid})
 
-    return {"ok": True, "deleted": mbid}
+    return {"ok": True, "deleted": mbid, "unbound_items": unbound}
 
 
 @router.post("/local-albums")
