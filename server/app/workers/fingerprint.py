@@ -212,6 +212,15 @@ def _write_back(
     if album_artist_mbid:
         queue.enqueue("mb_fetch_artist", {"artist_mbid": album_artist_mbid})
 
+    # 心愿单 phase 2: fingerprint 写完元数据，看看这张是不是心愿单上的，是的话打勾
+    try:
+        from app.api.wishlist import _fulfill_matching_wishlist  # noqa: PLC0415
+        n = _fulfill_matching_wishlist()
+        if n > 0:
+            log.info("fingerprint: %d wishlist item(s) auto-fulfilled", n)
+    except Exception:
+        pass  # fulfilled 失败不阻塞主流程
+
 
 def _canonical_artist_name(artist_mbid: str | None) -> str | None:
     """从 mb_artist 缓存表查 canonical name，没缓存返回 None.
