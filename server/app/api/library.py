@@ -228,6 +228,30 @@ def _list_artists_rows(
         if "mb_pending" in m:
             m["mb_pending"] = bool(m["mb_pending"])
         out.append(m)
+
+    # 末尾追加"未识别"虚拟艺人 —— 完全没 mb_artistid/mb_albumartistid 的 items
+    # （fingerprint 全失败、beets 没回填 tag）。让用户看得到这堆，能去整理
+    try:
+        with get_engine().connect() as conn:
+            orphan_count = conn.execute(text(
+                """SELECT COUNT(*) FROM beets.items
+                   WHERE COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) = ''"""
+            )).scalar() or 0
+        if int(orphan_count) > 0 and filter_kind in ("all", "incomplete", "no_mb_cache"):
+            out.append({
+                "mbid": NO_ARTIST_MBID,
+                "items_count": int(orphan_count),
+                "total": 0,
+                "owned": 0,
+                "completeness": None,
+                "name": "",  # 让 client 按 locale 渲染
+                "sort_name": "~~~",
+                "country": "",
+                "mb_pending": False,
+            })
+    except Exception:
+        pass
+
     return out
 
 
@@ -238,6 +262,11 @@ async def list_artists(
 ) -> dict:
     rows = _list_artists_rows(sort, filter)
     return {"sort": sort, "filter": filter, "count": len(rows), "artists": rows}
+
+
+# 合成"未识别艺人"sentinel：items 完全没 mb_artistid/mb_albumartistid 的会
+# 在艺人列表末尾出现一个虚拟艺人，点进去就是按目录聚合的兜底专辑。
+NO_ARTIST_MBID = "__orphan__"
 
 
 FORMAT_PRIORITY: dict[str, int] = {
@@ -2372,6 +2401,41 @@ async def owned_albums(mbid: str) -> dict:
         if isinstance(p, (bytes, memoryview)):
             return bytes(p).decode("utf-8", errors="replace")
         return p or ""
+
+    # 特例：'__orphan__' 虚拟艺人 → 直接返回无 artist mbid 的 items 聚合
+    if mbid == NO_ARTIST_MBID:
+        with get_engine().connect() as conn:
+            orphan_items = conn.execute(
+                text(
+                    """SELECT id, path
+                       FROM beets.items
+                       WHERE COALESCE(NULLIF(mb_albumartistid, ''),
+                                      mb_artistid) = ''"""
+                )
+            ).all()
+        by_dir_orphan: dict[str, list[Any]] = defaultdict(list)
+        for r in orphan_items:
+            p = _decode_path(r.path)
+            if not p:
+                continue
+            d = os.path.dirname(p)
+            if d:
+                by_dir_orphan[d].append(r)
+        result_orphan: list[dict] = []
+        for d, its in sorted(by_dir_orphan.items()):
+            title = os.path.basename(d) or "(unknown)"
+            synth = _synth_local_album_mbid(d)
+            result_orphan.append({
+                "mbid": synth,
+                "title": title,
+                "primary_type": "",
+                "secondary_types": "",
+                "first_release_date": "",
+                "cover_url": f"/api/v1/covers/release-group/{synth}/500",
+                "owned_items": len(its),
+                "is_local": True,
+            })
+        return {"count": len(result_orphan), "albums": result_orphan}
 
     with get_engine().connect() as conn:
         # 兜底：is_local 列可能还没 migrate（仅查询时手动 add 一次，写过的版本会从下次开始稳定 SELECT）
