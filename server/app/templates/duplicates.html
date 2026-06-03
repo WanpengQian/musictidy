@@ -3,53 +3,112 @@
 
 {% block content %}
 <section class="page-head">
-  <h1>重复文件 <span class="muted small">({{ groups|length }} 组)</span></h1>
-  <p class="muted small">同一 MusicBrainz 录音 ID 但多个文件 = 同曲多格式。
-  系统推荐 ✓ 的是 <strong>无损优先</strong>；其他建议删除 (✗)。</p>
+  <h1>重复</h1>
+  <p class="muted small">两个视角：<strong>专辑级</strong>抓"整张被复制"（同一 release-group 散在多个目录）；
+  <strong>曲目级</strong>抓"同一首歌多份"（FLAC + MP3 跨格式各存一份）。先处理专辑级，跨格式的曲目级会顺着减下来。</p>
 </section>
 
-{% if not groups %}
-<p class="empty muted">
-  当前没找到重复。可能原因：还没识别到指纹级 / 真的没重复。
-</p>
-{% endif %}
+<nav class="dup-tabs">
+  <a href="#albums" class="dup-tab dup-tab--active">📀 专辑级 ({{ albums|length }})</a>
+  <a href="#tracks" class="dup-tab">🎵 曲目级 ({{ groups|length }})</a>
+</nav>
 
-<div class="dup-list">
-{% for g in groups %}
-<div class="dup-group">
-  <header class="dup-group__head">
-    <span class="dup-group__title">{{ g.title or "(无标题)" }}</span>
-    <span class="muted small">{{ g.artist }} — {{ g.album }}</span>
-    <span class="badge">{{ g.count }} 个文件</span>
-  </header>
-  <table class="dup-files">
-    <thead>
-      <tr>
-        <th>建议</th>
-        <th>格式</th>
-        <th>码率</th>
-        <th>采样</th>
-        <th>时长</th>
-        <th class="path-col">路径</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for f in g.files %}
-      <tr class="dup-file {% if f.recommended %}dup-file--keep{% else %}dup-file--drop{% endif %}">
-        <td>{% if f.recommended %}<span class="ok">✓ 保留</span>{% else %}<span class="warn">✗ 删除</span>{% endif %}</td>
-        <td><strong>{{ f.format }}</strong></td>
-        <td>{% if f.bitrate %}{{ (f.bitrate / 1000) | int }} kbps{% endif %}</td>
-        <td>{% if f.samplerate %}{{ f.samplerate }}{% endif %}</td>
-        <td>{% if f.length %}{{ ((f.length // 60) | int) }}:{{ "%02d"|format((f.length % 60) | int) }}{% endif %}</td>
-        <td class="path-col">
-          <span class="muted small">{{ f.dir }}/</span><br>
-          <span>{{ f.filename }}</span>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</div>
-{% endfor %}
-</div>
+<section id="albums" class="page-section">
+  <h2>📀 专辑级重复 <span class="muted small">({{ albums|length }} 张)</span></h2>
+
+  {% if not albums %}
+  <p class="empty muted">没找到。专辑级重复指：同一张 release-group 在 ≥ 2 个主文件夹里。</p>
+  {% endif %}
+
+  <div class="dup-list">
+  {% for a in albums %}
+  <div class="dup-group">
+    <header class="dup-group__head">
+      <span class="dup-group__title">{{ a.title or "(无标题)" }}</span>
+      <span class="muted small">{{ a.artist }}</span>
+      {% if a.mb_total_tracks %}
+        <span class="badge">MB: {{ a.mb_total_tracks }} 曲</span>
+      {% endif %}
+      <span class="badge">{{ a.folder_count }} 个文件夹</span>
+    </header>
+    <table class="dup-files">
+      <thead>
+        <tr>
+          <th>建议</th>
+          <th>曲数</th>
+          <th>完整度</th>
+          <th>格式</th>
+          <th>平均码率</th>
+          <th>估大小</th>
+          <th class="path-col">主文件夹</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in a.candidates %}
+        <tr class="dup-file {% if c.recommended %}dup-file--keep{% else %}dup-file--drop{% endif %}">
+          <td>{% if c.recommended %}<span class="ok">✓ 保留</span>{% else %}<span class="warn">？删除</span>{% endif %}</td>
+          <td>{{ c.item_count }}</td>
+          <td>{% if c.completeness is not none %}{{ (c.completeness * 100) | round(0) | int }}%{% else %}—{% endif %}</td>
+          <td>
+            {% for fmt, n in c.formats.items() %}<span class="chip">{{ fmt }}×{{ n }}</span>{% endfor %}
+          </td>
+          <td>{{ c.avg_bitrate_kbps }} kbps</td>
+          <td>{% if c.est_size_bytes > 1024 * 1024 * 1024 %}{{ (c.est_size_bytes / 1024 / 1024 / 1024) | round(1) }} GB{% else %}{{ (c.est_size_bytes / 1024 / 1024) | round(0) | int }} MB{% endif %}</td>
+          <td class="path-col"><code>{{ c.dir }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+  </div>
+</section>
+
+<section id="tracks" class="page-section">
+  <h2>🎵 曲目级重复 <span class="muted small">({{ groups|length }} 组)</span></h2>
+  <p class="muted small">同一 MusicBrainz 录音 ID 但多个文件 = 同曲多格式。系统推荐 ✓ 的是 <strong>无损优先</strong>；其他建议删除 (✗)。</p>
+
+  {% if not groups %}
+  <p class="empty muted">当前没找到。可能原因：还没识别到指纹级 / 真的没重复。</p>
+  {% endif %}
+
+  <div class="dup-list">
+  {% for g in groups %}
+  <div class="dup-group">
+    <header class="dup-group__head">
+      <span class="dup-group__title">{{ g.title or "(无标题)" }}</span>
+      <span class="muted small">{{ g.artist }} — {{ g.album }}</span>
+      <span class="badge">{{ g.count }} 个文件</span>
+    </header>
+    <table class="dup-files">
+      <thead>
+        <tr>
+          <th>建议</th>
+          <th>格式</th>
+          <th>码率</th>
+          <th>采样</th>
+          <th>时长</th>
+          <th class="path-col">路径</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in g.files %}
+        <tr class="dup-file {% if f.recommended %}dup-file--keep{% else %}dup-file--drop{% endif %}">
+          <td>{% if f.recommended %}<span class="ok">✓ 保留</span>{% else %}<span class="warn">✗ 删除</span>{% endif %}</td>
+          <td><strong>{{ f.format }}</strong></td>
+          <td>{% if f.bitrate %}{{ (f.bitrate / 1000) | int }} kbps{% endif %}</td>
+          <td>{% if f.samplerate %}{{ f.samplerate }}{% endif %}</td>
+          <td>{% if f.length %}{{ ((f.length // 60) | int) }}:{{ "%02d"|format((f.length % 60) | int) }}{% endif %}</td>
+          <td class="path-col">
+            <span class="muted small">{{ f.dir }}/</span><br>
+            <span>{{ f.filename }}</span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+  </div>
+</section>
 {% endblock %}

@@ -315,6 +315,145 @@ def _list_duplicate_groups() -> list[dict[str, Any]]:
         return out
 
 
+def _list_album_duplicates() -> list[dict[str, Any]]:
+    """专辑级重复：同一张 release-group 的 items 散在 ≥2 个主文件夹里。
+
+    "主文件夹" = items 路径里出现次数最多的 dirname。同一张专辑被扫两次
+    （NAS FLAC + 备份 MP3，或 source/destination 没去重）会触发这条。
+
+    每个候选文件夹返回：
+      - 主目录、items 数、格式分布、平均码率、总字节数
+      - 完整度 = 该文件夹内 items 数 / MB canonical 曲目数 (拉不到时返 None)
+      - is_recommended：跨候选挑一份"无损优先 + 最完整"
+
+    跟 _list_duplicate_groups() 互补：曲目级抓 FLAC+MP3 跨格式同曲，
+    专辑级抓"整张被复制"。
+    """
+    import os  # noqa: PLC0415
+    from collections import Counter  # noqa: PLC0415
+
+    def _decode(p: object) -> str:
+        if isinstance(p, (bytes, memoryview)):
+            return bytes(p).decode("utf-8", errors="replace")
+        return p or ""
+
+    with get_engine().connect() as conn:
+        # 先找有 ≥ 2 个 distinct dir 的 release-group —— 这是粗筛，再细判
+        rgs = conn.execute(
+            text(
+                """SELECT mb_releasegroupid, COUNT(*) AS n
+                   FROM beets.items
+                   WHERE mb_releasegroupid != ''
+                   GROUP BY mb_releasegroupid
+                   HAVING n > 1
+                   ORDER BY n DESC"""
+            )
+        ).all()
+
+        out: list[dict[str, Any]] = []
+        for rg in rgs:
+            mbid = rg.mb_releasegroupid
+            rows = conn.execute(
+                text(
+                    """SELECT id, path, format, bitrate, length, title
+                       FROM beets.items
+                       WHERE mb_releasegroupid = :rg"""
+                ),
+                {"rg": mbid},
+            ).all()
+
+            # 按主文件夹分组 items
+            by_dir: dict[str, list[Any]] = {}
+            for r in rows:
+                p = _decode(r.path)
+                if not p:
+                    continue
+                d = os.path.dirname(p)
+                by_dir.setdefault(d, []).append(r)
+            if len(by_dir) < 2:
+                continue  # 只有一个目录，曲目级 dedup 才管它
+
+            # MB canonical 曲目数（用 mb_release_group.tracks_json 拉，没就 None）
+            head = conn.execute(
+                text(
+                    """SELECT title, artist_mbid, tracks_json
+                       FROM mb_release_group WHERE mbid=:m"""
+                ),
+                {"m": mbid},
+            ).first()
+            mb_total: int | None = None
+            title = ""
+            artist_mbid = ""
+            if head:
+                title = head.title or ""
+                artist_mbid = head.artist_mbid or ""
+                if head.tracks_json:
+                    try:
+                        mb_total = len(json.loads(head.tracks_json))
+                    except (TypeError, ValueError):
+                        mb_total = None
+
+            artist_name = ""
+            if artist_mbid:
+                a = conn.execute(
+                    text("SELECT name FROM mb_artist WHERE mbid=:m"),
+                    {"m": artist_mbid},
+                ).first()
+                if a:
+                    artist_name = a.name or ""
+
+            candidates: list[dict[str, Any]] = []
+            for d, its in by_dir.items():
+                fmts = Counter((it.format or "").upper() for it in its)
+                avg_bitrate = (
+                    sum(int(it.bitrate or 0) for it in its) // max(1, len(its))
+                ) // 1000
+                # 估总大小：用 length * bitrate 近似，免做 os.stat（NAS 上慢）
+                est_bytes = sum(
+                    int((it.length or 0) * (it.bitrate or 0) / 8) for it in its
+                )
+                # 找该候选最"贵"格式作排序键
+                best_prio = min(
+                    (FORMAT_PRIORITY.get(f, 9) for f in fmts), default=9
+                )
+                completeness = (
+                    (len(its) / mb_total) if mb_total else None
+                )
+                candidates.append({
+                    "dir": d,
+                    "item_count": len(its),
+                    "formats": dict(fmts),
+                    "avg_bitrate_kbps": int(avg_bitrate),
+                    "est_size_bytes": int(est_bytes),
+                    "completeness": completeness,
+                    "_prio": best_prio,
+                    "item_ids": [int(it.id) for it in its],
+                })
+
+            # 排序：无损优先 + 完整度高 + items 多
+            ranked = sorted(
+                candidates,
+                key=lambda c: (
+                    c["_prio"],
+                    -(c["completeness"] or 0),
+                    -c["item_count"],
+                ),
+            )
+            for i, c in enumerate(ranked):
+                c["recommended"] = i == 0
+                c.pop("_prio", None)
+
+            out.append({
+                "mb_releasegroupid": mbid,
+                "title": title,
+                "artist": artist_name,
+                "mb_total_tracks": mb_total,
+                "folder_count": len(ranked),
+                "candidates": ranked,
+            })
+        return out
+
+
 PLAYABLE_EXTS = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".aiff", ".alac"}
 
 # 浏览器 HTML5 <audio> 普遍能直放的格式 —— 这些走原码不转码省一笔 CPU + 转码缓存。
@@ -1077,6 +1216,19 @@ async def list_duplicates() -> dict:
     except Exception:
         groups = []
     return {"count": len(groups), "groups": groups}
+
+
+@router.get("/duplicates/albums")
+async def list_album_duplicates() -> dict:
+    """专辑级重复：同一张专辑分散在 ≥ 2 个主文件夹的情形。
+
+    跟 /duplicates 互补：前者抓"同一首歌多份"，这个抓"整张被复制"。
+    """
+    try:
+        albums = _list_album_duplicates()
+    except Exception:
+        albums = []
+    return {"count": len(albums), "albums": albums}
 
 
 @router.get("/artists/{mbid}")

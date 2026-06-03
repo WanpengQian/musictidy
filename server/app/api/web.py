@@ -11,7 +11,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import text
 
 from app import auth
-from app.api.library import _list_artists_rows, _list_duplicate_groups, artist_detail
+from app.api.library import (
+    _list_album_duplicates,
+    _list_artists_rows,
+    _list_duplicate_groups,
+    artist_detail,
+)
 from app.config import get_settings
 from app.db import get_engine
 from app.templates_engine import templates
@@ -222,11 +227,16 @@ async def duplicates_page(request: Request):
     try:
         groups = _list_duplicate_groups()
     except Exception:
-        log.exception("duplicates page failed")
+        log.exception("duplicates page failed (track-level)")
         groups = []
+    try:
+        albums = _list_album_duplicates()
+    except Exception:
+        log.exception("duplicates page failed (album-level)")
+        albums = []
     return templates.TemplateResponse(
         request, "duplicates.html",
-        {"groups": groups},
+        {"groups": groups, "albums": albums},
     )
 
 

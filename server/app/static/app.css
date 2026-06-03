@@ -198,3 +198,23 @@ h2 { font-weight: 600; font-size: 1.15em; margin: 1.5em 0 0.6em; }
   font-family: ui-monospace, Menlo, monospace; font-size: 0.85em;
   white-space: pre-wrap; word-break: break-all; overflow-x: auto;
 }
+
+/* ── duplicates: 专辑级 + 曲目级 ─────── */
+.dup-tabs {
+  display: flex; gap: 0.6em; margin: 1em 0 1.5em;
+}
+.dup-tab {
+  display: inline-block; padding: 0.4em 0.9em;
+  background: var(--surface); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 999px;
+  text-decoration: none; font-size: 0.9em;
+}
+.dup-tab:hover { background: #f4f6f8; }
+.dup-tab--active { background: var(--owned-soft, #e8f5e9); border-color: var(--owned, #2e7d32); }
+.page-section { margin: 2em 0 3em; padding-top: 0.5em; scroll-margin-top: 60px; }
+.page-section h2 { margin: 0.2em 0 0.8em; }
+.chip {
+  display: inline-block; padding: 0.1em 0.45em; margin-right: 0.3em;
+  background: var(--owned-soft, #eef2ff); color: var(--fg);
+  border-radius: 4px; font-size: 0.82em; font-family: ui-monospace, monospace;
+}
