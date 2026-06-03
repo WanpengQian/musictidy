@@ -1387,6 +1387,27 @@ async def bind_item(item_id: int, payload: dict) -> dict:
     }
 
 
+@router.post("/items/{item_id}/unbind")
+async def unbind_item(item_id: int) -> dict:
+    """清掉 item 的 mb_trackid + mb_releasegroupid。
+
+    场景：fingerprint 把一首歌错认到某张专辑了，幻影"1 首歌专辑"挂在艺人页。
+    用户解绑后 item 回到本地兜底视图，幻影专辑自然消失 (没 item 命中了)。
+    文件本身不动。
+    """
+    from app import beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+    ok = beets_bridge.set_item_meta(
+        lib, item_id, track_mbid="", releasegroup_mbid=""
+    )
+    if not ok:
+        raise HTTPException(404, detail="item not found")
+    return {"ok": True, "item_id": item_id}
+
+
 @router.post("/items/{item_id}/prewarm")
 async def prewarm_item(
     item_id: int,
