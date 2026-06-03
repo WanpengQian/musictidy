@@ -1873,6 +1873,8 @@ def _local_dir_playable(mbid: str) -> dict:
         "orphan_items": orphan_items,
         "owned_count": 0,
         "total_count": 0,
+        "is_local": False,
+        "dirs": [dir_path] if rows else [],
     }
 
 
@@ -2040,6 +2042,11 @@ async def release_group_playable(mbid: str) -> dict:
             "alternatives_count": max(0, len(cands) - (1 if bound else 0)),
         })
 
+    # 来源目录：从 item_dirs 收集 distinct，按出现次数排
+    from collections import Counter as _Counter  # noqa: PLC0415
+    dirs_counter = _Counter(item_dirs)
+    dirs_list = [d for d, _ in dirs_counter.most_common()]
+
     return {
         "release_group_mbid": mbid,
         "title": rg.get("title", ""),
@@ -2052,6 +2059,7 @@ async def release_group_playable(mbid: str) -> dict:
         "owned_count": sum(1 for t in tracks_out if t["bound_item"]),
         "total_count": len(tracks_out),
         "is_local": bool(rg.get("is_local") or 0),
+        "dirs": dirs_list,
     }
 
 
