@@ -6,7 +6,9 @@ MusicTidy turns the pile of MP3 / FLAC / APE files you've been hoarding for 20 y
 
 - 🌐 Project page: <https://musictidy.com>
 - 🎵 Live demo: <https://demo.musictidy.com> · scheme `https` · host `demo.musictidy.com` · password `demo2026`
-- 📚 Deployment guide: <https://musictidy.com/deploy>
+- 🖥 Web client: **<https://app.musictidy.com>** — free, no install, just point at your server
+- 📱 iOS client: App Store
+- 📚 Deployment guide: <https://musictidy.com/deploy> · Cloudflare Tunnel quickstart: [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md)
 - 🔐 Privacy policy: <https://musictidy.com/privacy>
 - 💬 Bugs / questions: [GitHub Issues](https://github.com/WanpengQian/musictidy/issues)
 
@@ -38,7 +40,16 @@ cp ../.env.example .env
 # → http://localhost:8765/healthz
 ```
 
-Full deployment guide (systemd unit, reverse proxy, Cloudflare Tunnel, backups, upgrades) at <https://musictidy.com/deploy>.
+### Make it reachable from outside without opening ports
+
+The recommended way is **Cloudflare Tunnel** — free, no port forwarding, no DDNS, automatic HTTPS, works behind CGNAT. Walks through it in [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md). Once your tunnel is up and you have e.g. `m.your-domain.com` pointing at your local server:
+
+- iOS app: enter `m.your-domain.com` in server setup
+- Web: open [https://app.musictidy.com](https://app.musictidy.com), enter the same address
+
+The web client is hosted free at `app.musictidy.com` and connects directly to **your** server — your music never touches our infrastructure.
+
+Full deployment guide (systemd unit, reverse proxy, backups, upgrades) at <https://musictidy.com/deploy>.
 
 ## How it works (one paragraph)
 

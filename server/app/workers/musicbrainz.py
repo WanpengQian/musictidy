@@ -285,10 +285,13 @@ async def handle_fetch_artist(payload: dict[str, Any]) -> None:
 
     _configure_user_agent()
     try:
+        # musicbrainzngs lib 的 VALID_INCLUDES 没收 "genres"（虽然 MB API 支持 inc=genres）。
+        # 之前传 "genres" 会直接 InvalidIncludeError 让**所有** mb_fetch_artist 集体失败。
+        # 走 "tags" 就够 —— _upsert_artist 已经合并 genre-list + tag-list。
         data = await _rate_limited(
             musicbrainzngs.get_artist_by_id,
             artist_mbid,
-            includes=["release-groups", "genres", "tags"],
+            includes=["release-groups", "tags"],
         )
     except musicbrainzngs.ResponseError as e:
         # 404 / 错的 mbid —— 不重试

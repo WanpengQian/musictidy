@@ -106,8 +106,12 @@ def gc_expired_sessions() -> int:
 
 
 def extract_token_from_request(request) -> str | None:
-    """优先看 Authorization: Bearer，再看 cookie session_token."""
+    """优先看 Authorization: Bearer，然后 ?token= query（给 <img>/<audio> 用），
+    最后 cookie session_token."""
     h = request.headers.get("authorization", "")
     if h.startswith("Bearer "):
         return h[len("Bearer "):].strip() or None
+    qtok = request.query_params.get("token")
+    if qtok:
+        return qtok.strip() or None
     return request.cookies.get("session_token")

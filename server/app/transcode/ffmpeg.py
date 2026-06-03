@@ -97,16 +97,32 @@ async def get_or_transcode_aac(item_id: int, src: Path, bitrate: int) -> Tuple[b
             return cached
         async with _get_sem():
             log.info("transcoding item=%d → AAC %dk (mem)", item_id, bitrate)
-            data = await _run_ffmpeg([
-                "ffmpeg", "-loglevel", "warning",
-                "-i", str(src),
-                "-vn",
-                "-c:a", "aac",
-                "-b:a", f"{bitrate}k",
-                "-f", "adts",            # ADTS 流式 AAC，pipe 输出 OK
-                "pipe:1",
-            ])
-            _cache.put(key, data, "audio/aac")
+            # 用 MP4 (M4A) + +faststart —— ADTS 容器 ffmpeg 写出来 duration 不对
+            # 浏览器读乱套。MP4 pipe 不能用 +faststart（要 seekable），所以走临时
+            # 文件再 read 回内存。短歌转码后 ~5MB 一档，完全可接受。
+            import tempfile  # noqa: PLC0415
+
+            with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                await _run_ffmpeg([
+                    "ffmpeg", "-y", "-loglevel", "warning",
+                    "-i", str(src),
+                    "-vn",
+                    "-c:a", "aac",
+                    "-b:a", f"{bitrate}k",
+                    "-movflags", "+faststart",
+                    "-f", "mp4",
+                    tmp_path,
+                ])
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+            finally:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _cache.put(key, data, "audio/mp4")
     return _cache.get(key)  # type: ignore[return-value]
 
 

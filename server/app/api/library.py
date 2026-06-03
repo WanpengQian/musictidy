@@ -165,7 +165,10 @@ def _list_artists_rows(
     WITH lib_artists AS (
         SELECT
             COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) AS mbid,
-            COUNT(*) AS items_count
+            COUNT(*) AS items_count,
+            -- 文件 tag 里的 albumartist 作为兜底名字。MB 还没 fetch 时立刻
+            -- 显示出来；mb_artist.name 一旦拉到就会覆盖。
+            MAX(COALESCE(NULLIF(albumartist, ''), artist)) AS raw_name
         FROM beets.items
         WHERE COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != ''
           AND COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != '{VARIOUS_ARTISTS_MBID}'
@@ -193,9 +196,11 @@ def _list_artists_rows(
         CASE WHEN COALESCE(rc.total, 0) > 0
              THEN CAST(COALESCE(rc.owned, 0) AS REAL) / rc.total
              ELSE NULL END     AS completeness,
-        a.name,
-        a.sort_name,
-        a.country
+        COALESCE(NULLIF(a.name, ''), la.raw_name) AS name,
+        COALESCE(NULLIF(a.sort_name, ''), la.raw_name) AS sort_name,
+        a.country,
+        -- 让 iOS 端能区分"已是 MB 名"和"还在 fetch 中的临时名"，等 fetch 完会自动覆盖
+        (a.name IS NULL OR a.name = '') AS mb_pending
     FROM lib_artists la
     LEFT JOIN rg_counts rc ON rc.mbid = la.mbid
     LEFT JOIN mb_artist a ON a.mbid = la.mbid
@@ -219,6 +224,9 @@ def _list_artists_rows(
             continue
         if filter_kind == "no_mb_cache" and m["name"] is not None:
             continue
+        # SQLite 把 BOOLEAN 表达式返回为 0/1 int —— iOS Swift Bool decoder 不吃，转成 bool
+        if "mb_pending" in m:
+            m["mb_pending"] = bool(m["mb_pending"])
         out.append(m)
     return out
 
@@ -793,7 +801,12 @@ async def cover_release_group(mbid: str, size: int):
         raise HTTPException(502, detail=f"upstream: {e}") from e
 
     if resp.status_code == 404:
-        raise HTTPException(404, detail="cover not found")
+        # MB / CAA 上没图 —— 生成一张 SVG fallback（首字母 + 紫色调）
+        svg = _generate_fallback_cover(mbid, size)
+        return Response(
+            content=svg, media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
     if resp.status_code != 200:
         raise HTTPException(502, detail=f"upstream HTTP {resp.status_code}")
 
@@ -806,6 +819,53 @@ async def cover_release_group(mbid: str, size: int):
         _write_cover_into_album_dirs(mbid, resp.content)
 
     return FileResponse(cache_path, media_type="image/jpeg")
+
+
+def _generate_fallback_cover(mbid: str, size: int) -> bytes:
+    """没真封面时给 release-group 生成一张 SVG："首字母 + 渐变背景"。
+    色相基于 mbid hash 稳定；标题从 mb_release_group 拿；拿不到就用 ?
+    """
+    import hashlib  # noqa: PLC0415
+
+    title = ""
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT title FROM mb_release_group WHERE mbid=:m"),
+            {"m": mbid},
+        ).first()
+        if row:
+            title = (row.title or "").strip()
+
+    label = (title[:2] if title else "?").upper()
+
+    # 色相按 mbid 稳定算
+    h = int(hashlib.md5(mbid.encode()).hexdigest()[:4], 16) % 360
+    bg1 = f"hsl({h}, 60%, 40%)"
+    bg2 = f"hsl({(h + 35) % 360}, 70%, 25%)"
+    fg = "rgba(255,255,255,0.92)"
+
+    font_size = int(size * 0.45)
+
+    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" width="{size}" height="{size}">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="{bg1}"/>
+      <stop offset="100%" stop-color="{bg2}"/>
+    </linearGradient>
+  </defs>
+  <rect width="{size}" height="{size}" fill="url(#g)"/>
+  <text x="50%" y="50%" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif"
+        font-size="{font_size}" font-weight="800" letter-spacing="-2"
+        text-anchor="middle" dominant-baseline="central"
+        fill="{fg}">{_escape_xml(label)}</text>
+</svg>'''
+    return svg.encode("utf-8")
+
+
+def _escape_xml(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
 
 
 def _write_cover_into_album_dirs(mbid: str, data: bytes) -> None:
@@ -1244,6 +1304,168 @@ async def release_group_tracks(mbid: str) -> dict:
     return {"release_group_mbid": mbid, "tracks": tracks_out, "from_cache": False}
 
 
+@router.get("/release-groups/{mbid}/playable")
+async def release_group_playable(mbid: str) -> dict:
+    """MB-driven 专辑视图：返回 canonical MB 曲目表，每首附 bound_item（自动选的最佳本地副本）+ alternatives_count。
+
+    "MusicTidy 是 player，不是 file manager" —— iOS 端的 album 详情就读这个，
+    用户看到的永远是 MB 那张专辑（12 首就 12 首），不是 disk 上一堆重复 items。
+
+    bound_item 自动选规则：
+      1. 同 recording_mbid 的 items 里
+      2. 优先 lossless/原文件（FLAC > WAV > APE 等），其次按 bitrate 高的
+    """
+    import json  # noqa: PLC0415
+
+    # 复用 tracks endpoint 的缓存逻辑：先从 mb_release_group.tracks_json 拿
+    with get_engine().connect() as conn:
+        # release-group 元数据
+        rg_row = conn.execute(
+            text(
+                """SELECT mbid, title, primary_type, first_release_date,
+                          artist_mbid, tracks_json
+                   FROM mb_release_group WHERE mbid=:m"""
+            ),
+            {"m": mbid},
+        ).first()
+        if not rg_row:
+            raise HTTPException(404, detail="release-group not in cache; trigger /tracks first")
+        rg = dict(rg_row._mapping)
+
+        # artist 名
+        artist_name = ""
+        if rg.get("artist_mbid"):
+            a = conn.execute(
+                text("SELECT name FROM mb_artist WHERE mbid=:m"),
+                {"m": rg["artist_mbid"]},
+            ).first()
+            if a:
+                artist_name = a.name or ""
+
+        tracks_cached = rg.get("tracks_json")
+
+    # 缓存里没有 MB 曲目 → 直接复用 /tracks 的逻辑去拉一次（自动 + 缓存）
+    if not tracks_cached:
+        try:
+            sub = await release_group_tracks(mbid)
+            mb_tracks = sub.get("tracks") or []
+        except HTTPException:
+            mb_tracks = []
+    else:
+        try:
+            mb_tracks = json.loads(tracks_cached)
+        except (TypeError, ValueError):
+            mb_tracks = []
+
+    import os  # noqa: PLC0415
+
+    def _decode(p: object) -> str:
+        if isinstance(p, bytes):
+            return p.decode("utf-8", errors="replace")
+        return p or ""
+
+    with get_engine().connect() as conn:
+
+        # 一次性把所有同 release-group items 拉出来按 recording_mbid 索引
+        rows = conn.execute(
+            text(
+                """SELECT id, mb_trackid, title, format, bitrate, length, path
+                   FROM beets.items
+                   WHERE mb_releasegroupid = :rg"""
+            ),
+            {"rg": mbid},
+        ).all()
+        by_recording: dict[str, list[dict]] = {}
+        bound_ids: set[int] = set()
+        item_dirs: list[str] = []
+        for r in rows:
+            rec = r.mb_trackid or ""
+            path = _decode(r.path)
+            if path:
+                item_dirs.append(os.path.dirname(path))
+            if not rec:
+                continue
+            cand = {
+                "id": int(r.id),
+                "title": r.title or "",
+                "format": (r.format or "").upper(),
+                "bitrate_kbps": int((r.bitrate or 0) // 1000),
+                "length_s": float(r.length or 0),
+                "path": path,
+            }
+            by_recording.setdefault(rec, []).append(cand)
+            bound_ids.add(int(r.id))
+
+        # 找这张专辑 items 的"主文件夹"（出现次数最多的 dir） —— 用户的
+        # 文件一般按 album 一个文件夹放，"同文件夹未识别"的就是漏匹的歌
+        orphan_items: list[dict] = []
+        if item_dirs:
+            from collections import Counter  # noqa: PLC0415
+            main_dir = Counter(item_dirs).most_common(1)[0][0]
+            # 拉同文件夹下所有 items（含没绑到这张 rg 的）
+            folder_rows = conn.execute(
+                text(
+                    """SELECT id, mb_releasegroupid, mb_trackid, title, format,
+                              bitrate, length, path
+                       FROM beets.items
+                       WHERE path LIKE :p"""
+                ),
+                {"p": main_dir.rstrip("/") + "/%"},
+            ).all()
+            for r in folder_rows:
+                if int(r.id) in bound_ids:
+                    continue
+                # 排除明显跨专辑误入的（绑到别的 rg）
+                if (r.mb_releasegroupid or "") not in ("", mbid):
+                    continue
+                orphan_items.append({
+                    "id": int(r.id),
+                    "title": r.title or "",
+                    "format": (r.format or "").upper(),
+                    "bitrate_kbps": int((r.bitrate or 0) // 1000),
+                    "length_s": float(r.length or 0),
+                    "path": _decode(r.path),
+                    "filename": os.path.basename(_decode(r.path)),
+                })
+
+    # 给每首 MB 曲目挑最佳 item
+    def best(candidates: list[dict]) -> dict | None:
+        if not candidates:
+            return None
+        # 用 FORMAT_PRIORITY，越小越好；同优先比 bitrate
+        def score(c: dict) -> tuple[int, int]:
+            return (FORMAT_PRIORITY.get(c["format"], 99), -c["bitrate_kbps"])
+        return sorted(candidates, key=score)[0]
+
+    tracks_out: list[dict] = []
+    for t in mb_tracks:
+        rec_mbid = t.get("recording_mbid") or ""
+        cands = by_recording.get(rec_mbid, [])
+        bound = best(cands)
+        tracks_out.append({
+            "disc": int(t.get("disc", 1) or 1),
+            "position": int(t.get("position", 0) or 0),
+            "recording_mbid": rec_mbid,
+            "title": t.get("title", ""),
+            "length_s": float(t.get("length_s", 0)),
+            "bound_item": bound,
+            "alternatives_count": max(0, len(cands) - (1 if bound else 0)),
+        })
+
+    return {
+        "release_group_mbid": mbid,
+        "title": rg.get("title", ""),
+        "artist_mbid": rg.get("artist_mbid", ""),
+        "artist": artist_name,
+        "first_release_date": rg.get("first_release_date", ""),
+        "primary_type": rg.get("primary_type", ""),
+        "tracks": tracks_out,
+        "orphan_items": orphan_items,
+        "owned_count": sum(1 for t in tracks_out if t["bound_item"]),
+        "total_count": len(tracks_out),
+    }
+
+
 @router.post("/playlist/genre-summary")
 async def playlist_genre_summary(payload: dict) -> dict:
     """给 iOS 端"按风格搜图"用：传 item_ids，返回聚合后的 top genres + 一个建议
@@ -1338,6 +1560,64 @@ async def playlist_genre_summary(payload: dict) -> dict:
         "suggested_query": query,
         "artist_mbid_count": len(rows),
     }
+
+
+@router.post("/items/{item_id}/shazam-feedback")
+async def shazam_feedback(item_id: int, payload: dict) -> dict:
+    """iOS 端用 ShazamKit 识别后回传结果。
+    payload: { title, artist, isrc?, apple_music_id?, album? }
+
+    本端能做的事：
+      1. 直接更新 beets 的 title/artist（用户已经选 Shazam = 信任 Shazam 元数据）
+      2. 若给 isrc → 走 MB 的 ISRC 索引查 recording_mbid，命中则补 mb_trackid
+      3. 若给 apple_music_id → 留作后续 enrichment
+
+    iOS 拿这个 endpoint 等于"帮服务器整理"——Shazam catalog 远比 AcoustID 全，
+    特别是华语 / 日语商业曲。
+    """
+    title = (payload.get("title") or "").strip()
+    artist = (payload.get("artist") or "").strip()
+    isrc = (payload.get("isrc") or "").strip().upper()
+    apple_music_id = (payload.get("apple_music_id") or "").strip()
+    album = (payload.get("album") or "").strip() or None
+    if not title:
+        return {"ok": False, "reason": "title empty"}
+
+    s = get_settings()
+    if not s.beets_db.exists():
+        return {"ok": False, "reason": "beets DB 不存在"}
+
+    # 直接更新 beets.items 的 title / artist
+    with get_engine().begin() as conn:
+        # 通过 ATTACH 的 beets 库写
+        updates = ["title = :title", "artist = :artist"]
+        params = {"title": title, "artist": artist, "id": item_id}
+        if album:
+            updates.append("album = :album")
+            params["album"] = album
+        conn.execute(
+            text(f"UPDATE beets.items SET {', '.join(updates)} WHERE id = :id"),
+            params,
+        )
+
+    # TODO: ISRC → MB recording lookup worker。Shazam 的 isrc 在 MB 大概率有索引，
+    # 走 musicbrainzngs.search_recordings(isrc=...) 拿 recording mbid 就能 mb_trackid 自动落地。
+    return {
+        "ok": True,
+        "updated": {"title": title, "artist": artist, "isrc": isrc or None},
+        "isrc_lookup_todo": bool(isrc),
+    }
+
+
+@router.post("/items/{item_id}/refingerprint")
+async def refingerprint_item(item_id: int) -> dict:
+    """单首重跑 AcoustID 指纹识别. UI 端的"重新指纹匹配"按钮.
+
+    工作流: 把这一条 push 到 fingerprint queue，worker 会重新算指纹 + 查 MB 并写回。
+    """
+    from app.workers import queue  # noqa: PLC0415
+    queue.enqueue("fingerprint", {"item_id": item_id})
+    return {"ok": True, "queued": item_id}
 
 
 @router.post("/items/{item_id}/identify")

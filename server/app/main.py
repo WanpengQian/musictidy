@@ -80,6 +80,32 @@ def create_app() -> FastAPI:
 
     app.add_middleware(AuthMiddleware)
 
+    # CORS：让浏览器从 app.musictidy.com / 本地开发 vite dev server 都能直连用户自己的 server。
+    # iOS app fetch 不受 CORS，但 web app 必须开。
+    # **必须在 AuthMiddleware 之后 add**（FastAPI 中间件后加先跑），否则 OPTIONS
+    # preflight 会被 AuthMiddleware 401 掉。
+    from fastapi.middleware.cors import CORSMiddleware  # noqa: PLC0415
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "https://app.musictidy.com",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Length", "Content-Range"],
+    )
+
+    # /api/v1/* 全部 no-store —— 库状态实时变化，任何端缓存都会让"明明加了歌却刷不出来"再发生
+    @app.middleware("http")
+    async def _no_store_api(request, call_next):
+        resp = await call_next(request)
+        if request.url.path.startswith("/api/v1/"):
+            resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     # 静态文件 (htmx + css)
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
