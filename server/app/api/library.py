@@ -1082,6 +1082,36 @@ def _range_response(data: bytes, mime: str, range_header: str | None) -> Respons
     )
 
 
+@router.post("/items/{item_id}/bind")
+async def bind_item(item_id: int, payload: dict) -> dict:
+    """把一首本地 item 绑到指定 MB recording + release-group。
+
+    Web 端把 orphan 拖到 MB 曲目行用这个；之前没有从 web 改 mb_trackid 的入口。
+    payload: { "recording_mbid": str, "release_group_mbid": str }
+    """
+    rec = (payload.get("recording_mbid") or "").strip()
+    rg = (payload.get("release_group_mbid") or "").strip()
+    if not rec or not rg:
+        raise HTTPException(400, detail="recording_mbid + release_group_mbid required")
+
+    from app import beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+    ok = beets_bridge.set_item_meta(
+        lib, item_id, track_mbid=rec, releasegroup_mbid=rg
+    )
+    if not ok:
+        raise HTTPException(404, detail="item not found")
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "recording_mbid": rec,
+        "release_group_mbid": rg,
+    }
+
+
 @router.post("/items/{item_id}/prewarm")
 async def prewarm_item(
     item_id: int,
