@@ -1383,7 +1383,20 @@ async def bind_local_album_to_mb(local_mbid: str, payload: dict) -> dict:
         if beets_bridge.set_item_meta(lib, int(r.id), **kwargs):
             updated += 1
 
+    # 心愿单 phase 2: 目录批量绑到 MB 真专辑后, 看看这张是不是心愿单上的
+    _fulfill_after_bind()
     return {"ok": True, "rg_mbid": rg_mbid, "updated_items": updated}
+
+
+def _fulfill_after_bind() -> int:
+    """绑定流程之后顺手 fulfill 心愿单 —— 把 wishlist 跟 items 表对一遍，
+    items 已经有的对应专辑 fulfilled_at 标 now。返回新 fulfill 几条 (调用方
+    可以日志)。失败兜底返 0 不抛，免得影响主流程。"""
+    try:
+        from app.api.wishlist import _fulfill_matching_wishlist  # noqa: PLC0415
+        return _fulfill_matching_wishlist()
+    except Exception:
+        return 0
 
 
 @router.post("/items/{item_id}/bind")
@@ -1408,6 +1421,8 @@ async def bind_item(item_id: int, payload: dict) -> dict:
     )
     if not ok:
         raise HTTPException(404, detail="item not found")
+    # 心愿单 phase 2: 这次绑定可能让某张心愿单专辑命中本地，把它打勾
+    _fulfill_after_bind()
     return {
         "ok": True,
         "item_id": item_id,

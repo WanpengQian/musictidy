@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -19,6 +20,54 @@ from sqlalchemy import text
 from app.db import get_engine
 
 router = APIRouter()
+
+_MB_UA = "MusicTidy/0.3 ( https://musictidy.com )"
+
+
+async def _resolve_isrc_to_rg_mbid(isrc: str) -> tuple[str, str] | None:
+    """ISRC → (recording_mbid, release_group_mbid)。两跳 MB API：
+       1) /ws/2/isrc/<ISRC>?inc=recordings  → 拿一个 recording mbid
+       2) /ws/2/recording/<mbid>?inc=releases → 拿第一个 release 的 release-group
+       MB 限流 1 req/sec/IP，给 server 留点 timeout buffer 别太大。
+    """
+    if not isrc:
+        return None
+    headers = {"User-Agent": _MB_UA, "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            # MB ISRC resource 默认就含 recordings，inc=recordings 反而会 400
+            r = await client.get(
+                f"https://musicbrainz.org/ws/2/isrc/{isrc}",
+                params={"fmt": "json"},
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return None
+            recs = r.json().get("recordings") or []
+            if not recs:
+                return None
+            # 取第一个 recording —— ISRC 通常 1:1 但偶尔多
+            rec_mbid = recs[0].get("id")
+            if not rec_mbid:
+                return None
+
+            # 第二跳：recording → release → release-group
+            # 必须 inc=releases+release-groups 才能拿到嵌套的 rg id
+            r2 = await client.get(
+                f"https://musicbrainz.org/ws/2/recording/{rec_mbid}",
+                params={"inc": "releases+release-groups", "fmt": "json"},
+                headers=headers,
+            )
+            if r2.status_code != 200:
+                return None
+            releases = r2.json().get("releases") or []
+            for rel in releases:
+                rg = rel.get("release-group")
+                if rg and rg.get("id"):
+                    return (rec_mbid, rg["id"])
+            return None
+    except (httpx.RequestError, ValueError):
+        return None
 
 
 class WishlistItemIn(BaseModel):
@@ -73,8 +122,28 @@ async def list_wishlist() -> dict:
 
 @router.post("/wishlist")
 async def add_wishlist(payload: WishlistItemIn) -> dict:
-    """加一项；同 rg_mbid 重复加不报错（idempotent），但 added_at 不会更新。"""
+    """加一项；同 rg_mbid 重复加不报错（idempotent），但 added_at 不会更新。
+
+    iOS Shazam 用'shz-isrc-XXX'合成 mbid 提交；server 这里做一次 best-effort
+    MB 查询升级成真 release-group mbid，让 fulfilled 检测可用。MB 拉不到
+    （限流 / 没收录）就保持合成 mbid，用户后面手动确认或下次进入再尝试。
+    """
     now = int(time.time())
+
+    # Phase 2: shz-isrc-XXX 合成 mbid 试一次 ISRC → MB 升级
+    if payload.rg_mbid.startswith("shz-isrc-"):
+        isrc = payload.rg_mbid[len("shz-isrc-"):].strip()
+        resolved = await _resolve_isrc_to_rg_mbid(isrc)
+        if resolved:
+            rec_mbid, rg_mbid = resolved
+            # 用 model_copy 更新 payload (pydantic v2)
+            payload = payload.model_copy(update={
+                "rg_mbid": rg_mbid,
+                "source_recording_mbid": (
+                    payload.source_recording_mbid or rec_mbid
+                ),
+            })
+
     with get_engine().begin() as conn:
         # 看是不是已经存在
         exists = conn.execute(
