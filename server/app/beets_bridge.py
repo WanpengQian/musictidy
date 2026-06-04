@@ -225,7 +225,7 @@ def get_item_path(lib: Any, item_id: int) -> Path | None:
 
 
 def get_item_tags(lib: Any, item_id: int) -> dict[str, Any] | None:
-    """读 item 现有的关键 tag。用于 tag-based MB 搜索 fallback."""
+    """读 item 现有的关键 tag (含 MB id) — tag fallback / 已绑判断都用这个."""
     for it in lib.items(f"id:{item_id}"):
         return {
             "title": it.title or "",
@@ -235,6 +235,10 @@ def get_item_tags(lib: Any, item_id: int) -> dict[str, Any] | None:
             "track": int(it.track or 0),
             "year": int(it.year or 0),
             "length": float(it.length or 0.0),
+            "mb_trackid": it.mb_trackid or "",
+            "mb_releasegroupid": it.mb_releasegroupid or "",
+            "mb_artistid": it.mb_artistid or "",
+            "mb_albumartistid": it.mb_albumartistid or "",
         }
     return None
 

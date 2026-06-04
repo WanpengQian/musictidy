@@ -48,6 +48,25 @@ def walk_audio_files(root: Path) -> Iterator[Path]:
         yield p.resolve()
 
 
+def _is_file_stable(path: Path, settle_s: float = 1.5) -> bool:
+    """用户可能正在拷贝中, 看 size/mtime 在 settle_s 秒内是否一致.
+
+    一致 = 没在写; 不一致 = 还在写 → 跳过这次 scan, 等下次再来.
+    settle_s 故意小 (1.5s), 大多数 copy 一会儿就稳, 不想让 scan 卡太久.
+    文件不存在 (用户中途删了) 也算 unstable.
+    """
+    try:
+        s1 = path.stat()
+    except OSError:
+        return False
+    time.sleep(settle_s)
+    try:
+        s2 = path.stat()
+    except OSError:
+        return False
+    return s1.st_size == s2.st_size and s1.st_mtime == s2.st_mtime
+
+
 async def scan_and_import() -> dict[str, int]:
     """主入口：扫库 → import 新文件 → enqueue 指纹 + CUE 切轨任务.
 
@@ -85,6 +104,14 @@ async def _do_scan() -> dict[str, int]:
         if path in known:
             stats.skipped += 1
             continue
+
+        # 用户拷贝进行中? 文件大小 / mtime 在短时间内还在变 → 跳过等下次 scan
+        # (避免 import 进半成品 → fingerprint 算的指纹是部分内容 → 识别错)
+        if not _is_file_stable(path):
+            stats.skipped += 1
+            log.info("scan: %s 还在写入 (size/mtime 不稳), 跳过等下次", path.name)
+            continue
+
         item_id = beets_bridge.import_file(lib, path)
         if item_id is None:
             stats.failed += 1
@@ -122,6 +149,29 @@ async def _do_scan() -> dict[str, int]:
             [{"archive": str(a)} for a in archives_found],
         )
         log.info("scan: 已排 %d 个 archive_extract 任务", len(archives_found))
+
+    # 顺手清掉指向已不存在文件的 stale items (用户可能在 scan 之外删过文件)
+    stale_removed = 0
+    for it in list(lib.items()):
+        try:
+            raw = it.path
+            if isinstance(raw, (bytes, memoryview)):
+                p = Path(bytes(raw).decode("utf-8", errors="replace"))
+            else:
+                p = Path(str(raw))
+            if not p.is_absolute():
+                p = s.music_root / p
+            if not p.exists():
+                it.remove()
+                stale_removed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if stale_removed:
+        log.info("scan: 顺手清掉 %d 个指向不存在文件的 stale items", stale_removed)
+
+    # 排一次 sidecar 同步 — worker 自己会等队列里 fingerprint/cue_split
+    # 全部跑完才落 .musictidy.json, 防止写半成品
+    queue.enqueue("sync_sidecars", {"trigger": "scan"})
 
     elapsed = time.time() - started
     log.info(

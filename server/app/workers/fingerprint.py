@@ -46,8 +46,64 @@ async def handle_fingerprint(payload: dict[str, Any]) -> None:
     item_id = int(payload["item_id"])
     lib = beets_bridge.get_library(s.beets_db, s.music_root)
 
+    # 已经手工 / split 钉死了 rg + recording? 只跑指纹入本地库, 不动 mb_* 字段
+    pre_bound_tags = beets_bridge.get_item_tags(lib, item_id) or {}
+    pre_bound = bool(
+        pre_bound_tags.get("mb_trackid") and pre_bound_tags.get("mb_releasegroupid")
+    )
+
+    # 0. .musictidy.json sidecar 优先级最高 — 用户在该目录写了 rg_mbid 就是
+    # 这张专辑铁定的事, 跳过 AcoustID 直接按 filename position 钉。
+    if not pre_bound:
+        sidecar_path = beets_bridge.get_item_path(lib, item_id)
+        if sidecar_path and sidecar_path.exists():
+            if await _try_bind_from_sidecar(lib, item_id, sidecar_path):
+                return
+
+    # 0.5 md5 命中: byte-identical 文件 (移动/重命名/wipe 后 reload) 直接复用,
+    # 跳过 fpcalc + AcoustID. md5 流式 ~0.2s, fpcalc ~1-2s, 省 70%+ 时间。
+    item_md5: str | None = None
+    if not pre_bound:
+        path = beets_bridge.get_item_path(lib, item_id)
+        if path is not None and path.exists():
+            from app import fingerprint_db  # noqa: PLC0415
+            item_md5 = await asyncio.to_thread(fingerprint_db.compute_md5, path)
+            if item_md5:
+                md5_hit = fingerprint_db.lookup_by_md5(item_md5)
+                if md5_hit and md5_hit.get("recording_mbid"):
+                    log.info(
+                        "fingerprint: item %d md5 命中 rec=%s rg=%s, 跳过 fpcalc + AcoustID",
+                        item_id, md5_hit.get("recording_mbid"),
+                        md5_hit.get("release_group_mbid"),
+                    )
+                    _write_back(
+                        lib, item_id,
+                        source=f"md5-cache ({md5_hit.get('source','?')})",
+                        rec_mbid=md5_hit.get("recording_mbid"),
+                        rg_mbid=md5_hit.get("release_group_mbid") or None,
+                        artist_mbid=None,
+                        album_artist_mbid=None,
+                        score=None,
+                    )
+                    # 顺手存 (item_id 不同, md5/fp 串都一样)
+                    fingerprint_db.save(
+                        item_id=item_id,
+                        fingerprint=md5_hit.get("fingerprint") or "",
+                        duration_s=float(md5_hit.get("duration_s") or 0),
+                        recording_mbid=md5_hit.get("recording_mbid"),
+                        release_group_mbid=md5_hit.get("release_group_mbid") or None,
+                        title=md5_hit.get("title"),
+                        artist=md5_hit.get("artist"),
+                        album=md5_hit.get("album"),
+                        source=md5_hit.get("source") or "md5-cache",
+                        md5=item_md5,
+                    )
+                    return
+
     # 1. AcoustID 指纹路径
     acoustid_match = None
+    fp_str: str | None = None
+    fp_dur: float | None = None
     if s.acoustid_api_key:
         path = beets_bridge.get_item_path(lib, item_id)
         if path is None:
@@ -56,9 +112,8 @@ async def handle_fingerprint(payload: dict[str, Any]) -> None:
         if path.exists():
             # 拿当前 album tag —— 用来在 AcoustID 返回的多个 release-group
             # 里挑正确的（同一首歌可能出现在单曲+专辑+合集，rg 不一样）
-            existing_tags = beets_bridge.get_item_tags(lib, item_id) or {}
-            acoustid_match = await _try_acoustid(
-                path, s.acoustid_api_key, existing_tags.get("album", ""),
+            fp_str, fp_dur, acoustid_match = await _try_acoustid(
+                path, s.acoustid_api_key, pre_bound_tags.get("album", ""),
             )
     elif not _warned_no_key:
         log.warning(
@@ -68,16 +123,57 @@ async def handle_fingerprint(payload: dict[str, Any]) -> None:
         )
         _warned_no_key = True
 
+    # 0.5 fpcalc 出来的指纹串先查本地 manual 缓存 (优先级高于 AcoustID).
+    # 用户手动标的 = 真理, AcoustID 的 _pick_release_group 不该把它覆盖。
+    # 跨 wipe 也救 — 同一文件 fp 串字节一致, 老 manual 行能直接被命中。
+    if not pre_bound and fp_str:
+        from app import fingerprint_db  # noqa: PLC0415
+        manual_hit = fingerprint_db.lookup_by_fingerprint(fp_str, manual_only=True)
+        if manual_hit and manual_hit.get("recording_mbid"):
+            log.info(
+                "fingerprint: item %d 本地 manual 缓存命中 rec=%s rg=%s, 跳过 AcoustID",
+                item_id, manual_hit.get("recording_mbid"),
+                manual_hit.get("release_group_mbid"),
+            )
+            _write_back(
+                lib, item_id, source="manual-cache",
+                rec_mbid=manual_hit.get("recording_mbid"),
+                rg_mbid=manual_hit.get("release_group_mbid") or None,
+                artist_mbid=None,
+                album_artist_mbid=None,
+                score=None,
+            )
+            fingerprint_db.save(
+                item_id=item_id,
+                fingerprint=fp_str,
+                duration_s=float(fp_dur or 0),
+                recording_mbid=manual_hit.get("recording_mbid"),
+                release_group_mbid=manual_hit.get("release_group_mbid") or None,
+                title=manual_hit.get("title"),
+                artist=manual_hit.get("artist"),
+                album=manual_hit.get("album"),
+                source="manual",  # 维持 manual 血统
+                md5=item_md5,
+            )
+            return
+
     if acoustid_match is not None:
         # 把指纹和元数据顺手存进我们自己的指纹库
         from app import fingerprint_db  # noqa: PLC0415
-        fp_str = acoustid_match.pop("_fp", None)
-        fp_dur = acoustid_match.pop("_duration", None)
+        acoustid_match.pop("_fp", None)
+        acoustid_match.pop("_duration", None)
         rec_title = acoustid_match.pop("_rec_title", None)
         rec_artist = acoustid_match.pop("_rec_artist", None)
         rec_album = acoustid_match.pop("_rec_album", None)
+        candidate_rgs = acoustid_match.pop("_candidate_rgs", None)
 
-        _write_back(lib, item_id, source="acoustid", **acoustid_match)
+        if pre_bound:
+            log.info(
+                "fingerprint: item %d 已手动钉死, AcoustID 命中 rec=%s 仅入指纹库",
+                item_id, acoustid_match.get("rec_mbid"),
+            )
+        else:
+            _write_back(lib, item_id, source="acoustid", **acoustid_match)
 
         if fp_str and fp_dur:
             fingerprint_db.save(
@@ -85,11 +181,52 @@ async def handle_fingerprint(payload: dict[str, Any]) -> None:
                 fingerprint=fp_str,
                 duration_s=float(fp_dur),
                 recording_mbid=acoustid_match["rec_mbid"],
+                release_group_mbid=acoustid_match.get("rg_mbid"),
                 title=rec_title,
                 artist=rec_artist,
                 album=rec_album,
                 source="acoustid",
+                candidate_rgs=candidate_rgs,
+                md5=item_md5,
             )
+        return
+
+    # 1.5 AcoustID 没命中 → 查我们自己的本地指纹缓存
+    # 上次识别过 / 用户人工 identify 过同一首歌的 fp 都会在这里命中
+    # (中文/小众专辑 AcoustID 库里没有时, 这条是唯一指望)
+    if not pre_bound and fp_str:
+        from app import fingerprint_db  # noqa: PLC0415
+        hit = fingerprint_db.lookup_by_fingerprint(fp_str)
+        if hit and hit.get("recording_mbid"):
+            log.info(
+                "fingerprint: item %d 本地指纹缓存命中 rec=%s rg=%s",
+                item_id, hit.get("recording_mbid"), hit.get("release_group_mbid"),
+            )
+            _write_back(
+                lib, item_id, source="local-cache",
+                rec_mbid=hit.get("recording_mbid"),
+                rg_mbid=hit.get("release_group_mbid") or None,
+                artist_mbid=None,
+                album_artist_mbid=None,
+                score=None,
+            )
+            # 顺手把当前 item 的 fp 也存一份 (item_id 这次不同了, 但 fp 串一样)
+            fingerprint_db.save(
+                item_id=item_id,
+                fingerprint=fp_str,
+                duration_s=float(fp_dur or 0),
+                recording_mbid=hit.get("recording_mbid"),
+                release_group_mbid=hit.get("release_group_mbid") or None,
+                title=hit.get("title"),
+                artist=hit.get("artist"),
+                album=hit.get("album"),
+                source="local-cache",
+                md5=item_md5,
+            )
+            return
+
+    # 已手动钉死 → 不走 tag fallback (避免 rg 被冲)
+    if pre_bound:
         return
 
     # 2. Tag-based fallback —— MB 按 artist+album 搜
@@ -140,10 +277,11 @@ async def handle_fingerprint(payload: dict[str, Any]) -> None:
 
 
 async def _try_acoustid(path, api_key: str, current_album: str = ""):
-    """跑 fpcalc + AcoustID。返回 match dict 或 None；致命错误抛.
+    """跑 fpcalc + AcoustID。
 
-    current_album: 文件 tag 里已有的专辑名，用于在 AcoustID 返回的多个
-    release-group 候选里挑正确的（同一 recording 可能出现在多张专辑）.
+    返回 (fp_str, duration, match_dict_or_None);
+    fp 跑出来但 AcoustID miss 时 match=None, 调用方可以拿 fp 查本地缓存。
+    fpcalc 都跑不动 → 返回 (None, None, None) 走 tag fallback。
     """
     global _warned_no_fpcalc
     try:
@@ -156,30 +294,37 @@ async def _try_acoustid(path, api_key: str, current_album: str = ""):
                 "fingerprint: 找不到 fpcalc；macOS: brew install chromaprint。"
             )
             _warned_no_fpcalc = True
-        return None  # 走 tag fallback
+        return None, None, None
     except acoustid.FingerprintGenerationError as e:
         log.warning("fingerprint: fpcalc 失败 %s — %s", path, e)
-        return None
+        return None, None, None
     except acoustid.WebServiceError as e:
         log.warning("fingerprint: AcoustID API 错: %s", e)
         raise  # 网络问题 → 重试
 
     if result is None:
-        return None
-    (score, rec_mbid, rg_mbid, artist_mbid, album_artist_mbid,
-     fp_str, duration, rec_title, rec_artist, rec_album) = result
-    return {
-        "score": score,
-        "rec_mbid": rec_mbid,
-        "rg_mbid": rg_mbid,
-        "artist_mbid": artist_mbid,
-        "_fp": fp_str,
-        "_duration": duration,
-        "_rec_title": rec_title,
-        "_rec_artist": rec_artist,
-        "_rec_album": rec_album,
-        "album_artist_mbid": album_artist_mbid,
-    }
+        return None, None, None
+    # 命中: 11-tuple (新增 candidate_rg_mbids); 未命中: 3-tuple (fp_str, dur, None)
+    if len(result) >= 11:
+        (score, rec_mbid, rg_mbid, artist_mbid, album_artist_mbid,
+         fp_str, duration, rec_title, rec_artist, rec_album,
+         candidate_rgs) = result[:11]
+        match = {
+            "score": score,
+            "rec_mbid": rec_mbid,
+            "rg_mbid": rg_mbid,
+            "artist_mbid": artist_mbid,
+            "_fp": fp_str,
+            "_duration": duration,
+            "_rec_title": rec_title,
+            "_rec_artist": rec_artist,
+            "_rec_album": rec_album,
+            "_candidate_rgs": candidate_rgs,  # 全部候选, 给跨 dir 投票用
+            "album_artist_mbid": album_artist_mbid,
+        }
+        return fp_str, duration, match
+    fp_str, duration, _ = result
+    return fp_str, duration, None
 
 
 def _write_back(
@@ -221,6 +366,97 @@ def _write_back(
     except Exception:
         pass  # fulfilled 失败不阻塞主流程
 
+    # 整张专辑做成一个大 FLAC 的检测: 文件 length ≈ rg 总长 + 单文件
+    # → 自动入 split_suggestion, 用户在 web 顶栏一键确认拆
+    if rg_mbid:
+        try:
+            from app.api.library import maybe_enqueue_split_suggestion  # noqa: PLC0415
+            maybe_enqueue_split_suggestion(item_id, rg_mbid)
+        except Exception:
+            pass  # 检测失败也不阻塞主流程
+
+
+async def _try_bind_from_sidecar(lib, item_id: int, path) -> bool:
+    """该目录有 .musictidy.json + rg_mbid → 按 filename position 直接绑.
+
+    成功返回 True (主流程 return), 失败 / 没 sidecar / 不合适 → False 让
+    主流程继续 (AcoustID 等)。
+    """
+    import json as _json  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
+    import re as _re  # noqa: PLC0415
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app import info_sidecar  # noqa: PLC0415
+    from app.db import get_engine  # noqa: PLC0415
+
+    sidecar = info_sidecar.read(path.parent)
+    if not sidecar:
+        return False
+    rg_mbid = (sidecar.get("rg_mbid") or "").strip()
+    if not rg_mbid:
+        return False
+
+    # 拿 rg 的 canonical tracks (没缓存就拉一次)
+    tracks: list[dict] = []
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT tracks_json FROM mb_release_group WHERE mbid=:m"),
+            {"m": rg_mbid},
+        ).first()
+    if row and row.tracks_json:
+        try:
+            raw = _json.loads(row.tracks_json)
+            if isinstance(raw, list):
+                tracks = sorted(raw, key=lambda t: int(t.get("position") or 0))
+        except (TypeError, ValueError):
+            pass
+    if not tracks:
+        # 同步拉一次, 尽量别让 fingerprint worker 卡住更长
+        try:
+            from app.api.library import release_group_tracks  # noqa: PLC0415
+            sub = await release_group_tracks(rg_mbid)
+            tracks = sorted(sub.get("tracks") or [],
+                            key=lambda t: int(t.get("position") or 0))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # filename 提 position. 常见多种格式都试:
+    #   "01. xxx.flac"        — 最常见
+    #   "Track No 5.ape"     — 老论坛 rip 风格
+    #   "Track 5.flac"
+    #   "05_xxx.flac"
+    fname = _os.path.basename(str(path))
+    rec_mbid: str | None = None
+    pos: int | None = None
+    for pat in (
+        r"^\s*(\d{1,2})[.\s_-]",                 # 01. xxx / 01_xxx / 01 xxx / 01-xxx
+        r"Track\s*N[o.]?\s*(\d{1,2})",           # Track No 5 / Track No.5 / TrackN5
+        r"Track[\s_-]+(\d{1,2})",                # Track 5 / Track_5 / Track-5
+    ):
+        m = _re.search(pat, fname, _re.I)
+        if m:
+            pos = int(m.group(1))
+            break
+    if pos is not None and tracks and 1 <= pos <= len(tracks):
+        rec_mbid = tracks[pos - 1].get("recording_mbid") or None
+
+    # 至少 rg 一定能定; rec_mbid 取不到也认了 (用户进 web 再手动匹配曲目)
+    _write_back(
+        lib, item_id, source="sidecar",
+        rec_mbid=rec_mbid,
+        rg_mbid=rg_mbid,
+        artist_mbid=(sidecar.get("artist_mbid") or "").strip() or None,
+        album_artist_mbid=(sidecar.get("artist_mbid") or "").strip() or None,
+        score=None,
+    )
+    log.info(
+        "fingerprint: item %d 走 .musictidy.json sidecar rg=%s rec=%s",
+        item_id, rg_mbid, (rec_mbid or "")[:8],
+    )
+    return True
+
 
 def _canonical_artist_name(artist_mbid: str | None) -> str | None:
     """从 mb_artist 缓存表查 canonical name，没缓存返回 None.
@@ -245,31 +481,33 @@ def _canonical_artist_name(artist_mbid: str | None) -> str | None:
 def _blocking_fingerprint_and_lookup(
     path: Path, api_key: str, current_album: str = "",
 ):
-    """阻塞调用 fpcalc + AcoustID HTTP。返回 tuple 或 None。
+    """阻塞调用 fpcalc + AcoustID HTTP。
 
-    tuple 内容:
-      (score, rec_mbid, rg_mbid, artist_mbid, album_artist_mbid,
-       fp_str, duration, rec_title, rec_artist_name, rec_album_title)
+    返回:
+      - 命中 → 10-tuple (score, rec_mbid, rg_mbid, artist_mbid, album_artist_mbid,
+                         fp_str, duration, rec_title, rec_artist_name, rec_album_title)
+      - 未命中但 fpcalc 成功 → 3-tuple (fp_str, duration, None)
+      - fpcalc 失败 → 抛 acoustid.FingerprintGenerationError (调用方 catch)
     """
     duration, fp = acoustid.fingerprint_file(str(path))
     fp_str = fp.decode("ascii") if isinstance(fp, bytes) else str(fp)
     response = acoustid.lookup(api_key, fp, duration, meta=ACOUSTID_META)
 
     if response.get("status") != "ok":
-        return None
+        return fp_str, duration, None
 
     results = response.get("results") or []
     if not results:
-        return None
+        return fp_str, duration, None
 
     best = max(results, key=lambda r: r.get("score", 0.0))
     score = float(best.get("score", 0.0))
     if score < MIN_SCORE:
-        return None
+        return fp_str, duration, None
 
     recordings = best.get("recordings") or []
     if not recordings:
-        return None
+        return fp_str, duration, None
 
     rec = recordings[0]
     rec_mbid = rec.get("id")
@@ -286,6 +524,7 @@ def _blocking_fingerprint_and_lookup(
     rg_mbid = None
     album_artist_mbid = None
     rec_album_title = None
+    candidate_rg_mbids: list[str] = [r.get("id") for r in rgs if r.get("id")]
     if rgs:
         rg = _pick_release_group(rgs, current_album)
         rg_mbid = rg.get("id")
@@ -297,6 +536,7 @@ def _blocking_fingerprint_and_lookup(
     return (
         score, rec_mbid, rg_mbid, artist_mbid, album_artist_mbid or artist_mbid,
         fp_str, float(duration), rec_title, rec_artist_name, rec_album_title,
+        candidate_rg_mbids,
     )
 
 

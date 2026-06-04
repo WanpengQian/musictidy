@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import time
 from pathlib import Path as PPath
 from typing import Any
 
@@ -20,6 +22,7 @@ from sqlalchemy import text
 
 from app.db import get_engine
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 SORT_CLAUSES: dict[str, str] = {
@@ -169,6 +172,9 @@ def _list_artists_rows(
     pt_placeholders = ",".join(f":pt{i}" for i in range(len(primary_types)))
     pt_params = {f"pt{i}": t for i, t in enumerate(primary_types)}
 
+    # 噪音过滤: items_count < 3 的艺人不进 Browse 列表。
+    # 真用户收藏一张专辑至少 ~10 首; 1-2 首基本是合唱/翻唱 leak (例: 许茹芸+
+    # 熊天平 你的眼睛 唯一候选 rg 是熊天平的愛情多惱河 → 熊天平本不该冒泡)。
     sql = f"""
     WITH lib_artists AS (
         SELECT
@@ -181,6 +187,7 @@ def _list_artists_rows(
         WHERE COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != ''
           AND COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != '{VARIOUS_ARTISTS_MBID}'
         GROUP BY 1
+        HAVING items_count >= 3
     ),
     rg_counts AS (
         SELECT
@@ -1007,7 +1014,15 @@ async def cover_release_group(mbid: str, size: int):
         raise HTTPException(502, detail=f"upstream: {e}") from e
 
     if resp.status_code == 404:
-        # MB / CAA 上没图 —— 生成一张 SVG fallback（首字母 + 紫色调）
+        # CAA 没图 → 优先用 dir 里 rip 自带的 cover.jpg/front.jpg/folder.jpg
+        # (中文小众专辑 CAA 覆盖率低, 但 rip 集普遍带封面). 没有再 SVG。
+        local = _find_local_cover_for_rg(mbid)
+        if local is not None:
+            ext = local.suffix.lower().lstrip(".")
+            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp"}.get(
+                ext, "application/octet-stream")
+            return FileResponse(local, media_type=mime)
         svg = _generate_fallback_cover(mbid, size)
         return Response(
             content=svg, media_type="image/svg+xml",
@@ -1025,6 +1040,56 @@ async def cover_release_group(mbid: str, size: int):
         _write_cover_into_album_dirs(mbid, resp.content)
 
     return FileResponse(cache_path, media_type="image/jpeg")
+
+
+_LOCAL_COVER_NAMES = ("cover", "front", "folder", "albumart", "album")
+_LOCAL_COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _find_local_cover_for_rg(mbid: str):
+    """rg 绑定的某个 item dir 里有 cover.jpg/front.jpg 等就返回该 Path.
+
+    中文小众专辑 CAA 覆盖率低 (许茹芸 27 张里 22 张没 CAA 封面), 但 rip
+    集普遍 dir 下带 cover.jpg → 拿来直接用, 比 SVG 兜底好得多。
+    """
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT path FROM beets.items "
+                "WHERE mb_releasegroupid=:m"
+            ),
+            {"m": mbid},
+        ).all()
+    seen_dirs: set[PPath] = set()
+    for r in rows:
+        raw = r.path
+        if isinstance(raw, (bytes, memoryview)):
+            p_str = bytes(raw).decode("utf-8", errors="replace")
+        else:
+            p_str = str(raw or "")
+        if not p_str:
+            continue
+        pp = PPath(p_str)
+        if not pp.is_absolute():
+            pp = s.music_root / pp
+        d = pp.parent
+        if d in seen_dirs:
+            continue
+        seen_dirs.add(d)
+        # 同 dir + 父 dir 都看一下 (CD1/CD2 子目录, 封面常放父目录)
+        for try_dir in (d, d.parent):
+            if not try_dir.is_dir():
+                continue
+            for nm in _LOCAL_COVER_NAMES:
+                for ext in _LOCAL_COVER_EXTS:
+                    for case in (nm + ext, nm.upper() + ext.upper(),
+                                 nm.capitalize() + ext):
+                        cand = try_dir / case
+                        if cand.is_file() and cand.stat().st_size > 0:
+                            return cand
+    return None
 
 
 def _generate_fallback_cover(mbid: str, size: int, *, explicit_title: str = "") -> bytes:
@@ -1391,6 +1456,13 @@ async def bind_local_album_to_mb(local_mbid: str, payload: dict) -> dict:
         if beets_bridge.set_item_meta(lib, int(r.id), **kwargs):
             updated += 1
 
+    # 写 sidecar — 这是该目录的 ground truth
+    from app import info_sidecar  # noqa: PLC0415
+    info_sidecar.write(PPath(dir_path), {
+        "rg_mbid": rg_mbid,
+        **({"artist_mbid": new_artist_mbid} if new_artist_mbid else {}),
+    })
+
     # 心愿单 phase 2: 目录批量绑到 MB 真专辑后, 看看这张是不是心愿单上的
     _fulfill_after_bind()
     return {"ok": True, "rg_mbid": rg_mbid, "updated_items": updated}
@@ -1416,8 +1488,10 @@ async def bind_item(item_id: int, payload: dict) -> dict:
     """
     rec = (payload.get("recording_mbid") or "").strip()
     rg = (payload.get("release_group_mbid") or "").strip()
-    if not rec or not rg:
-        raise HTTPException(400, detail="recording_mbid + release_group_mbid required")
+    # rg 必填; rec 可选 (空 = 只绑专辑不绑具体曲目, 用于「无专辑歌曲」拖
+    # 到专辑 tile 的场景: 先归属专辑, 用户进专辑页再拖到对的曲目)
+    if not rg:
+        raise HTTPException(400, detail="release_group_mbid required")
 
     from app import beets_bridge  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
@@ -1429,6 +1503,35 @@ async def bind_item(item_id: int, payload: dict) -> dict:
     )
     if not ok:
         raise HTTPException(404, detail="item not found")
+
+    # 把这次手动绑定的指纹存进本地缓存, wipe 后重导入这个文件能直接命中
+    # ("用户费力气标的"不应该一次重置就全没). 没 recording 时不存
+    # (光 rg 没 track 当不了缓存"答案", 仅 beets DB 记录)
+    path = beets_bridge.get_item_path(lib, item_id)
+    tags = beets_bridge.get_item_tags(lib, item_id) or {}
+    if rec and path is not None and path.exists():
+        from app import fingerprint_db  # noqa: PLC0415
+        await asyncio.to_thread(
+            fingerprint_db.extract_and_save,
+            item_id, path,
+            recording_mbid=rec,
+            release_group_mbid=rg,
+            title=tags.get("title"),
+            artist=tags.get("artist"),
+            album=tags.get("album"),
+            source="manual",
+        )
+
+    # 写 .musictidy.json sidecar — 这是该目录的 ground truth, 跨 wipe / 跨
+    # 机器都能让 fingerprint worker 自动按位置绑回去, 不靠 AcoustID 瞎猜
+    if path is not None and path.parent.is_dir():
+        from app import info_sidecar  # noqa: PLC0415
+        info_sidecar.write(path.parent, {
+            "rg_mbid": rg,
+            "_album": tags.get("album") or "",
+            "_artist": tags.get("artist") or "",
+        })
+
     # 心愿单 phase 2: 这次绑定可能让某张心愿单专辑命中本地，把它打勾
     _fulfill_after_bind()
     return {
@@ -1436,6 +1539,349 @@ async def bind_item(item_id: int, payload: dict) -> dict:
         "item_id": item_id,
         "recording_mbid": rec,
         "release_group_mbid": rg,
+    }
+
+
+# ── 自动检测「整张专辑做成一个大文件」并建议拆分 ────────────────
+# fingerprint worker 写完 rg_mbid 后, 触发此函数。
+# 满足条件就 INSERT 一条 split_suggestion, 用户在 web 顶栏看到。
+# 同 (item_id, rg_mbid) 重复检测幂等 (UNIQUE 约束)。
+_SPLIT_MIN_DURATION_S = 1500.0   # < 25min 单文件不算「整张专辑」
+_SPLIT_TOLERANCE_S = 60.0        # 文件总长与 MB 总长偏差阈值
+_SPLIT_LOSSLESS_FORMATS = ("FLAC", "WAV", "APE", "ALAC", "WV", "TTA")
+
+
+def _find_cue_for(audio_path: PPath) -> PPath | None:
+    """同目录里找一个 CUE, FILE 指向当前音频 (或文件名相近) 就返回。"""
+    parent = audio_path.parent
+    if not parent.exists():
+        return None
+    # case-insensitive .cue / .CUE
+    for cue in parent.iterdir():
+        if not cue.is_file() or cue.suffix.lower() != ".cue":
+            continue
+        # 最朴素的匹配: 同 stem 就算 (e.g. 'xx.APE' + 'xx.CUE')
+        if cue.stem == audio_path.stem:
+            return cue
+    # stem 不一样的情况: parse CUE, 看 FILE 字段
+    from app import cuesplit as _cs  # noqa: PLC0415
+    for cue in parent.iterdir():
+        if not cue.is_file() or cue.suffix.lower() != ".cue":
+            continue
+        try:
+            sheet = _cs.parse_cue(cue)
+        except Exception:  # noqa: BLE001
+            continue
+        if not sheet.tracks:
+            continue
+        if sheet.file and (parent / sheet.file).resolve() == audio_path.resolve():
+            return cue
+    return None
+
+
+def maybe_enqueue_split_suggestion(item_id: int, rg_mbid: str) -> bool:
+    """检测一条 item 是否「单文件 = 整张专辑」, 是的话 INSERT split_suggestion.
+
+    返回 True = 新建议入库, False = 不合格 / 已存在 / MB 没缓存 / 走了 CUE 路径。
+    fingerprint worker 调用时不带 await (纯 DB 操作), 失败静默不阻塞主流程。
+    """
+    if not rg_mbid:
+        return False
+    try:
+        with get_engine().connect() as conn:
+            # 1. 拿 item 元数据 (length / format / path)
+            it = conn.execute(
+                text("""SELECT id, length, format, path
+                        FROM beets.items WHERE id=:i"""),
+                {"i": item_id},
+            ).first()
+            if not it:
+                return False
+            length_s = float(it.length or 0)
+            fmt = (it.format or "").upper()
+            if length_s < _SPLIT_MIN_DURATION_S:
+                return False
+            if fmt not in _SPLIT_LOSSLESS_FORMATS:
+                return False
+
+            # 1.5 同目录有 CUE? 走 cue_split worker, 不弹 MB-based 建议.
+            # 时间戳从 CUE 来比 silencedetect 准, 优先用。
+            def _decode_path(p: object) -> str:
+                if isinstance(p, (bytes, memoryview)):
+                    return bytes(p).decode("utf-8", errors="replace")
+                return p or ""
+
+            audio_path = PPath(_decode_path(it.path))
+            cue_pair = _find_cue_for(audio_path)
+            if cue_pair is not None:
+                from app.workers import queue as _q  # noqa: PLC0415
+                _q.enqueue("cue_split", {
+                    "cue": str(cue_pair),
+                    "src_audio": str(audio_path),
+                    "rg_mbid": rg_mbid,  # 让 worker 给新 item 钉 rg
+                })
+                log.info(
+                    "split: item %d 同目录有 CUE (%s), 走 cue_split", item_id, cue_pair.name,
+                )
+                return False
+            # 2. 已经有这条建议? 跳过
+            existing = conn.execute(
+                text("""SELECT id FROM split_suggestion
+                        WHERE beets_item_id=:i AND rg_mbid=:m"""),
+                {"i": item_id, "m": rg_mbid},
+            ).first()
+            if existing:
+                return False
+            # 3. MB tracks_json 必须有 (fingerprint 阶段一般 release_group_tracks
+            #    还没拉; 那就这次先不弹, 等用户开过这张专辑详情触发缓存后下次再说)
+            rg_row = conn.execute(
+                text("SELECT tracks_json FROM mb_release_group WHERE mbid=:m"),
+                {"m": rg_mbid},
+            ).first()
+            raw = rg_row.tracks_json if rg_row else None
+            if not raw:
+                return False
+            try:
+                mb_tracks = json.loads(raw)
+            except (TypeError, ValueError):
+                return False
+            if len(mb_tracks) < 3:
+                return False
+            mb_total = sum(float(t.get("length_s") or 0) for t in mb_tracks)
+            if mb_total <= 0:
+                return False
+            if abs(length_s - mb_total) > _SPLIT_TOLERANCE_S:
+                return False
+
+            # 4. 都满足 → 插一条建议
+            def _decode_p(p: object) -> str:
+                if isinstance(p, (bytes, memoryview)):
+                    return bytes(p).decode("utf-8", errors="replace")
+                return p or ""
+
+            path_str = _decode_p(it.path)
+
+        with get_engine().begin() as conn:
+            conn.execute(
+                text(
+                    """INSERT OR IGNORE INTO split_suggestion
+                       (beets_item_id, rg_mbid, file_length_s,
+                        mb_total_length_s, mb_track_count, file_path, detected_at)
+                       VALUES (:i, :m, :fl, :ml, :n, :p, :now)"""
+                ),
+                {
+                    "i": item_id, "m": rg_mbid,
+                    "fl": length_s, "ml": mb_total,
+                    "n": len(mb_tracks), "p": path_str,
+                    "now": int(time.time()),
+                },
+            )
+        log.info(
+            "split_suggestion: item %d ≈ rg %s (%.1fs vs %.1fs, %d tracks)",
+            item_id, rg_mbid, length_s, mb_total, len(mb_tracks),
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("maybe_enqueue_split_suggestion failed")
+        return False
+
+
+@router.get("/split-suggestions")
+async def list_split_suggestions() -> dict:
+    """前端顶栏读这个;只返回 pending (未应用未忽略) 的。"""
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT s.id, s.beets_item_id, s.rg_mbid, s.file_length_s,
+                          s.mb_total_length_s, s.mb_track_count,
+                          s.file_path, s.detected_at,
+                          rg.title AS album_title,
+                          rg.artist_mbid,
+                          (SELECT name FROM mb_artist
+                           WHERE mbid=rg.artist_mbid) AS artist_name
+                   FROM split_suggestion s
+                   LEFT JOIN mb_release_group rg ON rg.mbid = s.rg_mbid
+                   WHERE s.dismissed_at IS NULL AND s.applied_at IS NULL
+                   ORDER BY s.detected_at DESC"""
+            )
+        ).all()
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r.id),
+            "item_id": int(r.beets_item_id),
+            "rg_mbid": r.rg_mbid,
+            "album_title": r.album_title or "",
+            "artist": r.artist_name or "",
+            "artist_mbid": r.artist_mbid or "",
+            "file_length_s": float(r.file_length_s or 0),
+            "mb_total_length_s": float(r.mb_total_length_s or 0),
+            "mb_track_count": int(r.mb_track_count or 0),
+            "file_basename": os.path.basename(r.file_path or ""),
+            "detected_at": int(r.detected_at or 0),
+        })
+    return {"count": len(out), "suggestions": out}
+
+
+@router.post("/split-suggestions/{sugg_id}/apply")
+async def apply_split_suggestion(sugg_id: int) -> dict:
+    """用户点了「应用建议」: 跑真正的 split-by-album。"""
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text(
+                """SELECT beets_item_id, rg_mbid, applied_at, dismissed_at
+                   FROM split_suggestion WHERE id=:i"""
+            ),
+            {"i": sugg_id},
+        ).first()
+    if not row:
+        raise HTTPException(404, detail="suggestion not found")
+    if row.applied_at:
+        raise HTTPException(409, detail="already applied")
+    if row.dismissed_at:
+        raise HTTPException(409, detail="already dismissed")
+
+    result = await split_item_by_album(
+        int(row.beets_item_id),
+        {"rg_mbid": row.rg_mbid},
+    )
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("UPDATE split_suggestion SET applied_at=:t WHERE id=:i"),
+            {"t": int(time.time()), "i": sugg_id},
+        )
+    return {"ok": True, "suggestion_id": sugg_id, "split": result}
+
+
+@router.post("/split-suggestions/{sugg_id}/dismiss")
+async def dismiss_split_suggestion(sugg_id: int) -> dict:
+    with get_engine().begin() as conn:
+        r = conn.execute(
+            text(
+                """UPDATE split_suggestion
+                   SET dismissed_at=:t
+                   WHERE id=:i AND applied_at IS NULL AND dismissed_at IS NULL"""
+            ),
+            {"t": int(time.time()), "i": sugg_id},
+        )
+        if r.rowcount == 0:
+            raise HTTPException(404, detail="suggestion not found or already resolved")
+    return {"ok": True, "suggestion_id": sugg_id}
+
+
+@router.post("/items/{item_id}/split-by-album")
+async def split_item_by_album(item_id: int, payload: dict) -> dict:
+    """整张专辑做成一个大 FLAC/APE/WAV 没 CUE 的情况, 用 MB canonical 曲长
+    + ffmpeg silencedetect 把它拆成 N 首单曲入库。
+
+    payload: { "rg_mbid": str }
+
+    流程：
+      1. 取 beets item 的源文件路径
+      2. 确保 mb_release_group.tracks_json 有 (没就拉 MB 缓存)
+      3. album_split.split_by_album_track_lengths()
+         - silencedetect 扫静音段
+         - 每个 MB 边界找 ±5s 内最近静音中点，没找到退回硬切
+         - ffmpeg -ss/-to 切 N 段, 命名 'NN. Title.flac'
+         - 原大文件 mv 到 .trash/manualsplit_<ts>/
+      4. beets DB 删原 item + import 新文件 + enqueue fingerprint
+    """
+    import json  # noqa: PLC0415
+
+    from app import album_split, beets_bridge  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+    from app.workers import queue  # noqa: PLC0415
+
+    rg_mbid = (payload.get("rg_mbid") or payload.get("release_group_mbid") or "").strip()
+    if not rg_mbid:
+        raise HTTPException(400, detail="rg_mbid required")
+    if rg_mbid.startswith("local-") or rg_mbid.startswith("localdir-"):
+        raise HTTPException(400, detail="rg_mbid must be a real MB release-group mbid")
+
+    s = get_settings()
+    if not s.allow_file_writes:
+        raise HTTPException(
+            409,
+            detail="ALLOW_FILE_WRITES=false; can't split files until you enable it",
+        )
+
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+    src = beets_bridge.get_item_path(lib, item_id)
+    if src is None or not src.exists():
+        raise HTTPException(404, detail="item not found or source file missing")
+
+    # 确保 MB tracks_json 有 (没就同步拉一次)
+    await release_group_tracks(rg_mbid)
+
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT tracks_json FROM mb_release_group WHERE mbid=:m"),
+            {"m": rg_mbid},
+        ).first()
+    raw = row.tracks_json if row else None
+    if not raw:
+        raise HTTPException(404, detail="MB tracks_json empty")
+    try:
+        mb_tracks = json.loads(raw)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(500, detail=f"tracks_json malformed: {e}") from e
+    if not mb_tracks:
+        raise HTTPException(404, detail="MB returned 0 tracks for this release-group")
+
+    out_dir = src.parent
+    trash_dir = s.trash_dir / f"manualsplit_{int(time.time())}_{src.stem[:30]}"
+
+    # 拷贝一份 position 升序的, 用来给新 item 钉 recording_mbid
+    sorted_mb_tracks = sorted(mb_tracks, key=lambda t: int(t.get("position") or 0))
+
+    try:
+        new_paths, summary = await asyncio.to_thread(
+            album_split.split_by_album_track_lengths,
+            src, sorted_mb_tracks, out_dir, trash_dir,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(500, detail=str(e)) from e
+
+    # beets: 删原 item, 然后 import 新文件
+    if not beets_bridge.remove_item_by_id(lib, item_id):
+        log.warning("split-by-album: remove old item id=%d failed (already gone?)", item_id)
+
+    # 切的时候我们已经知道每首 = MB 的哪首 recording, 不能再让 AcoustID
+    # 把里头随便几首识到别张专辑去 (best-of / 单曲版本). 直接钉死 rg + rec_mbid.
+    new_ids: list[int] = []
+    for i, p in enumerate(new_paths):
+        try:
+            iid = beets_bridge.import_file(lib, p)
+            if iid is None:
+                continue
+            new_ids.append(iid)
+            if i < len(sorted_mb_tracks):
+                rec_mbid = sorted_mb_tracks[i].get("recording_mbid") or None
+                beets_bridge.set_mb_ids(
+                    lib, iid,
+                    track_mbid=rec_mbid,
+                    releasegroup_mbid=rg_mbid,
+                    artist_mbid=None,
+                    album_artist_mbid=None,
+                    album_artist=None,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("split-by-album: import %s failed: %s", p, e)
+
+    # 还是排 fingerprint —— 钉死 rg 后 fingerprint worker 只会把指纹存进
+    # 我们自己的指纹库 (不再覆盖 mb_*); 后面 wishlist auto-fulfill 也用得上
+    if new_ids:
+        queue.enqueue_many("fingerprint", [{"item_id": i} for i in new_ids])
+
+    return {
+        "ok": True,
+        "removed_item_id": item_id,
+        "new_item_ids": new_ids,
+        "new_files": [str(p) for p in new_paths],
+        "summary": summary,
     }
 
 
@@ -1475,24 +1921,37 @@ async def clear_release_group_items(mbid: str) -> dict:
 
 
 @router.post("/items/{item_id}/unbind")
-async def unbind_item(item_id: int) -> dict:
-    """清掉 item 的 mb_trackid + mb_releasegroupid。
+async def unbind_item(
+    item_id: int,
+    level: str = Query("album", pattern="^(track|album|artist)$"),
+) -> dict:
+    """分级解绑 item。
 
-    场景：fingerprint 把一首歌错认到某张专辑了，幻影"1 首歌专辑"挂在艺人页。
-    用户解绑后 item 回到本地兜底视图，幻影专辑自然消失 (没 item 命中了)。
-    文件本身不动。
+    level=track  : 只清 mb_trackid (rg + artist 留着) →
+                   item 留在本专辑「同文件夹未识别」区, 可重新拖到对的曲目
+    level=album  : 清 mb_trackid + mb_releasegroupid (artist 留着) →
+                   item 从这张专辑剥离, 出现在艺人下的本地兜底专辑里
+    level=artist : 清 mb_trackid + mb_releasegroupid + mb_artistid +
+                   mb_albumartistid → item 完全无主, 进未识别堆
+    默认 level=album 保持老接口语义不变 (老 web 端没传 level 时不破坏)。
     """
     from app import beets_bridge  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
 
     s = get_settings()
     lib = beets_bridge.get_library(s.beets_db, s.music_root)
-    ok = beets_bridge.set_item_meta(
-        lib, item_id, track_mbid="", releasegroup_mbid=""
-    )
+
+    kwargs: dict = {"track_mbid": ""}
+    if level in ("album", "artist"):
+        kwargs["releasegroup_mbid"] = ""
+    if level == "artist":
+        kwargs["artist_mbid"] = ""
+        kwargs["album_artist_mbid"] = ""
+
+    ok = beets_bridge.set_item_meta(lib, item_id, **kwargs)
     if not ok:
         raise HTTPException(404, detail="item not found")
-    return {"ok": True, "item_id": item_id}
+    return {"ok": True, "item_id": item_id, "level": level}
 
 
 @router.post("/items/{item_id}/prewarm")
@@ -2073,13 +2532,46 @@ async def release_group_playable(mbid: str) -> dict:
                 bound_ids.add(int(r.id))
 
         # 找这张专辑 items 的"主文件夹"（出现次数最多的 dir） —— 用户的
-        # 文件一般按 album 一个文件夹放，"同文件夹未识别"的就是漏匹的歌
+        # 文件一般按 album 一个文件夹放，"同文件夹未识别"的就是漏匹的歌。
+        # 收 orphan 两条规则:
+        #   1. 绑到这张 rg 但 mb_trackid 不在 canonical 集合 (含 trackid="") —
+        #      用户「解绑曲目 level=track」后留在这张专辑等重绑
+        #   2. 同主目录, 完全没 rg, 同时也没绑到别张 rg — fingerprint 漏匹
         orphan_items: list[dict] = []
+        orphan_seen: set[int] = set()
+        from collections import Counter  # noqa: PLC0415
+
+        def _push_orphan(r):
+            iid = int(r.id)
+            if iid in bound_ids or iid in orphan_seen:
+                return
+            orphan_seen.add(iid)
+            orphan_items.append({
+                "id": iid,
+                "title": r.title or "",
+                "format": (r.format or "").upper(),
+                "bitrate_kbps": int((r.bitrate or 0) // 1000),
+                "length_s": float(r.length or 0),
+                "path": _decode(r.path),
+                "filename": os.path.basename(_decode(r.path)),
+            })
+
+        # 规则 1: 绑到这张 rg 但 trackid 不是 canonical (含空) → 留在这张待重绑
+        rg_orphan_rows = conn.execute(
+            text(
+                """SELECT id, mb_releasegroupid, mb_trackid, title, format,
+                          bitrate, length, path
+                   FROM beets.items
+                   WHERE mb_releasegroupid = :m"""
+            ),
+            {"m": mbid},
+        ).all()
+        for r in rg_orphan_rows:
+            _push_orphan(r)
+
+        # 规则 2: 主目录里没 rg 的 (fingerprint 漏匹的兜底)
         if item_dirs:
-            from collections import Counter  # noqa: PLC0415
             main_dir = Counter(item_dirs).most_common(1)[0][0]
-            # 拉同文件夹下所有 items（含没绑到这张 rg 的）
-            # beets items.path 是 BLOB；SQLite LIKE 对 BLOB 不生效，要 CAST 成 TEXT
             folder_rows = conn.execute(
                 text(
                     """SELECT id, mb_releasegroupid, mb_trackid, title, format,
@@ -2090,20 +2582,10 @@ async def release_group_playable(mbid: str) -> dict:
                 {"p": main_dir.rstrip("/") + "/%"},
             ).all()
             for r in folder_rows:
-                if int(r.id) in bound_ids:
-                    continue
                 # 排除明显跨专辑误入的（绑到别的 rg）
                 if (r.mb_releasegroupid or "") not in ("", mbid):
                     continue
-                orphan_items.append({
-                    "id": int(r.id),
-                    "title": r.title or "",
-                    "format": (r.format or "").upper(),
-                    "bitrate_kbps": int((r.bitrate or 0) // 1000),
-                    "length_s": float(r.length or 0),
-                    "path": _decode(r.path),
-                    "filename": os.path.basename(_decode(r.path)),
-                })
+                _push_orphan(r)
 
     # 给每首 MB 曲目挑最佳 item
     def best(candidates: list[dict]) -> dict | None:
@@ -2350,6 +2832,7 @@ async def identify_item(item_id: int, payload: dict) -> dict:
             fingerprint_db.extract_and_save,
             item_id, path,
             recording_mbid=payload.get("recording_mbid"),
+            release_group_mbid=payload.get("release_group_mbid"),
             title=payload.get("title"),
             artist=payload.get("artist"),
             album=payload.get("album"),
@@ -2508,14 +2991,35 @@ async def owned_albums(mbid: str) -> dict:
             # 没拉到就 None (前端别判完整 / 不完整)
             tj = d.pop("tracks_json", None)
             total = None
+            canonical_recs: list[str] = []
             if tj:
                 try:
                     parsed = json.loads(tj)
                     if isinstance(parsed, list):
                         total = len(parsed)
+                        canonical_recs = [
+                            t.get("recording_mbid") for t in parsed
+                            if t.get("recording_mbid")
+                        ]
                 except (TypeError, ValueError):
                     total = None
             d["total_tracks"] = total
+
+            # owned_items: 默认 SQL 给的"按 rg 命中的 items 行数"会把同曲多副本
+            # (lossless+lossy) 重复计数 → 可能 >= total 假完整。
+            # 知道 canonical recording 集合时改用 distinct mb_trackid in canonical
+            # 数, 一首歌不管几个副本只算一次, bonus track / 错绑也不混进来。
+            if canonical_recs:
+                from sqlalchemy import bindparam  # noqa: PLC0415
+                stmt = text(
+                    """SELECT COUNT(DISTINCT mb_trackid) FROM beets.items
+                       WHERE mb_releasegroupid = :rg
+                         AND mb_trackid IN :recs"""
+                ).bindparams(bindparam("recs", expanding=True))
+                owned = conn.execute(
+                    stmt, {"rg": d["mbid"], "recs": canonical_recs},
+                ).scalar() or 0
+                d["owned_items"] = int(owned)
             if is_local_flag:
                 # 本地策划专辑没 CAA 封面，前端直接走我们的 cover endpoint 拿 SVG
                 d["cover_url"] = f"/api/v1/covers/release-group/{d['mbid']}/500"
@@ -2527,7 +3031,7 @@ async def owned_albums(mbid: str) -> dict:
         # —— 本地兜底：artist 命中、但 release-group 没识别的 items ——
         local_items = conn.execute(
             text(
-                """SELECT id, path, album
+                """SELECT id, path, album, title, format, bitrate, length
                    FROM beets.items
                    WHERE COALESCE(NULLIF(mb_albumartistid, ''),
                                   mb_artistid) = :m
@@ -2537,6 +3041,7 @@ async def owned_albums(mbid: str) -> dict:
         ).all()
 
     by_dir: dict[str, list[Any]] = defaultdict(list)
+    loose: list[dict] = []
     for r in local_items:
         p = _decode_path(r.path)
         if not p:
@@ -2544,6 +3049,16 @@ async def owned_albums(mbid: str) -> dict:
         d = os.path.dirname(p)
         if d:
             by_dir[d].append(r)
+        loose.append({
+            "id": int(r.id),
+            "title": r.title or "",
+            "format": (r.format or "").upper(),
+            "bitrate_kbps": int((r.bitrate or 0) // 1000),
+            "length_s": float(r.length or 0),
+            "path": p,
+            "filename": os.path.basename(p),
+        })
+    loose.sort(key=lambda x: x["filename"])
 
     for d, its in sorted(by_dir.items()):
         title = os.path.basename(d) or "(unknown)"
@@ -2560,4 +3075,8 @@ async def owned_albums(mbid: str) -> dict:
             "total_tracks": len(its),  # localdir 本地兜底视图: 拥有的就是全部
         })
 
-    return {"count": len(result), "albums": result}
+    return {
+        "count": len(result),
+        "albums": result,
+        "loose_items": loose,
+    }

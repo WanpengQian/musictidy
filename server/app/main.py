@@ -33,12 +33,14 @@ async def lifespan(_app: FastAPI):
         fingerprint,
         musicbrainz,
         scheduler,
+        sync_sidecars,
     )
 
     scheduler.register_handler("fingerprint", fingerprint.handle_fingerprint)
     scheduler.register_handler("mb_fetch_artist", musicbrainz.handle_fetch_artist)
     scheduler.register_handler("cue_split", cue_split.handle_cue_split)
     scheduler.register_handler("archive_extract", archive_extract.handle_archive_extract)
+    scheduler.register_handler("sync_sidecars", sync_sidecars.handle_sync_sidecars)
     scheduler.start()
     try:
         yield

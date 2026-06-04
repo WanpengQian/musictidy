@@ -251,6 +251,219 @@ async def scan_cue_flac() -> dict:
     return {"ok": True, "enqueued": enqueued, "allow_file_writes": s.allow_file_writes}
 
 
+@router.post("/scan-split-suggestions")
+async def scan_split_suggestions() -> dict:
+    """全库扫一遍「单文件 = 整张专辑」候选, 给每条 hit 入 split_suggestion。
+
+    场景: 用户库里早就 fingerprint 过的大 FLAC, 当时 mb_release_group.tracks_json
+    可能还没缓存所以漏检; 用户在 web 点这个按钮一次性补齐建议列表。
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.api.library import (  # noqa: PLC0415
+        _SPLIT_LOSSLESS_FORMATS,
+        _SPLIT_MIN_DURATION_S,
+        maybe_enqueue_split_suggestion,
+    )
+    from app.db import get_engine  # noqa: PLC0415
+
+    fmts_csv = ",".join(f"'{f}'" for f in _SPLIT_LOSSLESS_FORMATS)
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""SELECT id, mb_releasegroupid
+                    FROM beets.items
+                    WHERE length > :min_len
+                      AND UPPER(COALESCE(format,'')) IN ({fmts_csv})
+                      AND COALESCE(mb_releasegroupid,'') != ''"""
+            ),
+            {"min_len": _SPLIT_MIN_DURATION_S},
+        ).all()
+    inserted = 0
+    for r in rows:
+        if maybe_enqueue_split_suggestion(int(r.id), r.mb_releasegroupid):
+            inserted += 1
+    return {"ok": True, "scanned": len(rows), "new_suggestions": inserted}
+
+
+@router.post("/sync-sidecars")
+async def sync_sidecars() -> dict:
+    """把当前 beets 的识别结果同步成 .musictidy.json 写到各专辑目录里。
+
+    每个目录里所有 items 都绑到同一个 rg → 写 sidecar 锁定. 不同 rg 混着
+    的目录跳过 (说明这张专辑还没整理干净, 不能定结论)。
+
+    用法:
+    - scan 完, 你确认识别结果差不多 OK 了, 调一下这个 endpoint, 把成果
+      落到 disk 上.
+    - 下次重新拷贝文件 / wipe + scan, fingerprint worker 起手读 sidecar
+      就能自动按 rg + position 钉死, 不用再人工纠正一遍 best-of 污染。
+    """
+    import os as _os  # noqa: PLC0415
+    from collections import defaultdict  # noqa: PLC0415
+    from pathlib import Path as PPath  # noqa: PLC0415
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app import info_sidecar  # noqa: PLC0415
+    from app.db import get_engine  # noqa: PLC0415
+
+    def _decode(p) -> str:
+        if isinstance(p, (bytes, memoryview)):
+            return bytes(p).decode("utf-8", errors="replace")
+        return p or ""
+
+    # beets 存的可能是相对路径; 补绝对
+    music_root = get_settings().music_root
+
+    def _abs(p_str: str) -> str:
+        if not p_str:
+            return ""
+        pp = PPath(p_str)
+        if not pp.is_absolute():
+            pp = music_root / pp
+        return str(pp)
+
+    # 跑一遍 dominant-per-folder 合并 (同 dir items candidate_rgs 投票)
+    try:
+        from app.workers.sync_sidecars import _consolidate_by_folder  # noqa: PLC0415
+        _consolidate_by_folder()
+    except Exception as e:  # noqa: BLE001
+        log.warning("admin/sync-sidecars: consolidation 失败 %s", e)
+
+    by_dir: dict[str, dict] = defaultdict(lambda: {
+        "rgs": set(), "artist_mbids": set(),
+        "album": "", "artist": "",
+    })
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT mb_releasegroupid, mb_artistid, mb_albumartistid,
+                          path, album, artist
+                   FROM beets.items
+                   WHERE mb_releasegroupid IS NOT NULL
+                     AND mb_releasegroupid != ''"""
+            )
+        ).all()
+    for r in rows:
+        p = _abs(_decode(r.path))
+        if not p:
+            continue
+        d = _os.path.dirname(p)
+        slot = by_dir[d]
+        slot["rgs"].add(r.mb_releasegroupid)
+        am = (r.mb_albumartistid or r.mb_artistid or "").strip()
+        if am:
+            slot["artist_mbids"].add(am)
+        if not slot["album"] and r.album:
+            slot["album"] = r.album
+        if not slot["artist"] and r.artist:
+            slot["artist"] = r.artist
+
+    written, skipped_mixed, skipped_nodir = 0, 0, 0
+    for d, slot in by_dir.items():
+        if len(slot["rgs"]) != 1:
+            skipped_mixed += 1
+            continue
+        dpath = PPath(d)
+        if not dpath.is_dir():
+            skipped_nodir += 1
+            continue
+        rg = next(iter(slot["rgs"]))
+        fields: dict = {"rg_mbid": rg}
+        if len(slot["artist_mbids"]) == 1:
+            fields["artist_mbid"] = next(iter(slot["artist_mbids"]))
+        if slot["album"]:
+            fields["_album"] = slot["album"]
+        if slot["artist"]:
+            fields["_artist"] = slot["artist"]
+        if info_sidecar.write(dpath, fields):
+            written += 1
+    return {
+        "ok": True,
+        "dirs_total": len(by_dir),
+        "sidecars_written": written,
+        "skipped_mixed_rg": skipped_mixed,
+        "skipped_no_dir": skipped_nodir,
+    }
+
+
+@router.post("/scheduler/pause-scan")
+async def pause_scheduled_scan() -> dict:
+    """临时暂停 30 分钟自动扫描 (测试场景: 用户在一个一个加目录).
+    server 重启自动恢复。
+    """
+    from app.workers import scheduler  # noqa: PLC0415
+    try:
+        scheduler._sched.remove_job("scan")  # type: ignore[attr-defined]
+        return {"ok": True, "paused": True}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)}
+
+
+@router.post("/scheduler/resume-scan")
+async def resume_scheduled_scan() -> dict:
+    """重新启用自动扫描 (跟启动后的默认行为一样, 30 min 一次)."""
+    from datetime import datetime, timedelta  # noqa: PLC0415
+
+    from app.workers import scheduler  # noqa: PLC0415
+    from app.workers.scan import scan_and_import  # noqa: PLC0415
+
+    try:
+        scheduler._sched.add_job(  # type: ignore[attr-defined]
+            scheduler._wrap_async(scan_and_import),  # type: ignore[attr-defined]
+            trigger="interval",
+            minutes=30,
+            id="scan",
+            next_run_time=datetime.now() + timedelta(seconds=30),
+            replace_existing=True,
+        )
+        return {"ok": True, "resumed": True}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)}
+
+
+@router.post("/cleanup-stale")
+async def cleanup_stale() -> dict:
+    """删除 beets 里指向已不存在文件的 items.
+
+    场景: 用户在 MusicTidy 不知情时直接删了音乐文件 / 改了路径,
+    items 留下"幽灵记录" → 库统计虚高, 播放 ENOENT。
+
+    路径不存在 → 直接 remove. 不动文件 (它本来就没了).
+    """
+    s = get_settings()
+    if not s.beets_db.exists():
+        return {"ok": False, "reason": "no beets DB"}
+    lib = beets_bridge.get_library(s.beets_db, s.music_root)
+
+    removed = 0
+    scanned = 0
+    for it in list(lib.items()):
+        scanned += 1
+        try:
+            from app.workers.scan import Path as _Path  # noqa: PLC0415
+            import os as _os  # noqa: PLC0415
+            raw = it.path
+            if isinstance(raw, (bytes, memoryview)):
+                p = _Path(bytes(raw).decode("utf-8", errors="replace"))
+            else:
+                p = _Path(str(raw))
+            if not p.is_absolute():
+                music_root = _Path(
+                    lib.directory.decode() if isinstance(lib.directory, (bytes, memoryview))
+                    else lib.directory
+                )
+                p = music_root / p
+            if not _os.path.exists(p):
+                it.remove()
+                removed += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("cleanup-stale: 处理 item %s 出错: %s", getattr(it, "id", "?"), e)
+            continue
+    return {"ok": True, "scanned": scanned, "removed_stale": removed}
+
+
 @router.post("/dedupe-paths")
 async def dedupe_paths() -> dict:
     """合并因 beets 路径不规范化造成的重复 item 行."""
@@ -260,6 +473,180 @@ async def dedupe_paths() -> dict:
     lib = beets_bridge.get_library(s.beets_db, s.music_root)
     removed = beets_bridge.dedupe_items_by_path(lib)
     return {"ok": True, "removed": removed}
+
+
+@router.post("/wipe-library")
+async def wipe_library(confirm: bool = False) -> dict:
+    """把库整个清空, 让用户重新拷文件 + 重新扫描跑全流程.
+
+    清:
+      - beets DB: items / albums (+ attribute 子表)
+      - musictidy DB: split_suggestion / track_fingerprint / task_queue /
+        item_decision / pending_decision / playlist_item / transcode_cache /
+        trash_log
+
+    保留:
+      - beets migrations
+      - musictidy: auth_session (别踢登录) / mb_artist + mb_release_group
+        (MB 缓存, 包含 tracks_json, 不要白白丢) / playlist (空壳留着) /
+        release_group_cover_pref / wishlist (用户的想要清单) / schema_migrations
+
+    磁盘上文件不动 — 用户自己用 rm / mv 处理。需 ?confirm=true.
+    """
+    if not confirm:
+        return {"ok": False, "reason": "需要 ?confirm=true"}
+    s = get_settings()
+    results: dict[str, int] = {}
+
+    # beets DB: 用 sqlalchemy 直接 DELETE, 比 lib.items() 循环快几个数量级
+    if s.beets_db.exists():
+        from sqlalchemy import create_engine  # noqa: PLC0415
+        bengine = create_engine(f"sqlite:///{s.beets_db}")
+        with bengine.begin() as bconn:
+            for tbl in ("item_attributes", "items", "album_attributes", "albums"):
+                r = bconn.execute(text(f"DELETE FROM {tbl}"))
+                results[f"beets.{tbl}"] = int(r.rowcount or 0)
+
+    # musictidy DB — 注意 track_fingerprint 不清, 那是用户辛辛苦苦攒下来的
+    # 识别历史; 拷新文件回来时 fingerprint worker 用本地指纹直接命中, 不用
+    # 重新跑 AcoustID 也能识别 (尤其救中文 / 小众专辑)
+    with get_engine().begin() as conn:
+        for tbl in (
+            "split_suggestion",
+            "task_queue",
+            "item_decision",
+            "pending_decision",
+            "playlist_item",
+            "transcode_cache",
+            "trash_log",
+        ):
+            try:
+                r = conn.execute(text(f"DELETE FROM {tbl}"))
+                results[f"musictidy.{tbl}"] = int(r.rowcount or 0)
+            except Exception as e:  # noqa: BLE001
+                results[f"musictidy.{tbl}"] = f"err: {e}"
+    return {"ok": True, "wiped": results,
+            "note": "beets lib 已清; 现在拷新文件然后 POST /admin/scan"}
+
+
+@router.get("/fingerprints/export")
+async def fingerprints_export() -> Response:
+    """导出本地指纹库到 JSON 文件 (下载)。
+    用于备份 / 跨机迁移 / wipe 前留底。
+    """
+    import json  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    from fastapi.responses import Response as _Response  # noqa: PLC0415
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.db import get_engine  # noqa: PLC0415
+
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT recording_mbid, release_group_mbid, fingerprint,
+                          duration_s, title, artist, album, source, created_at
+                   FROM track_fingerprint
+                   ORDER BY created_at"""
+            )
+        ).all()
+    data = {
+        "version": 1,
+        "exported_at": int(datetime.now(timezone.utc).timestamp()),
+        "count": len(rows),
+        "fingerprints": [
+            {
+                "recording_mbid": r.recording_mbid or "",
+                "release_group_mbid": r.release_group_mbid or "",
+                "fingerprint": r.fingerprint,
+                "duration_s": float(r.duration_s or 0),
+                "title": r.title or "",
+                "artist": r.artist or "",
+                "album": r.album or "",
+                "source": r.source or "",
+                "created_at": int(r.created_at or 0),
+            }
+            for r in rows
+        ],
+    }
+    body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    fname = f"musictidy-fingerprints-{data['exported_at']}.json"
+    return _Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.post("/fingerprints/import")
+async def fingerprints_import(payload: dict) -> dict:
+    """导入指纹 JSON (export 出来的格式)。
+
+    body: {"fingerprints": [{recording_mbid, release_group_mbid, fingerprint,
+                            duration_s, title, artist, album, source, created_at}, ...]}
+    冲突策略: 同 fingerprint 串已存在 → skip; 否则 INSERT (item_id 给个递减的
+    占位负数, 不影响真 items).
+    """
+    import time as _time  # noqa: PLC0415
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.db import get_engine  # noqa: PLC0415
+
+    rows = payload.get("fingerprints") or []
+    if not isinstance(rows, list):
+        raise HTTPException(400, detail="payload.fingerprints must be list")
+
+    inserted = 0
+    skipped = 0
+    # 从最小的 item_id 往下 (负数), 避免跟真 items 撞 (真 items 都是正 autoincrement)
+    with get_engine().begin() as conn:
+        min_id = conn.execute(
+            text("SELECT MIN(item_id) FROM track_fingerprint")
+        ).scalar() or 0
+        next_id = min(int(min_id), 0) - 1
+
+        for r in rows:
+            if not isinstance(r, dict):
+                skipped += 1
+                continue
+            fp = r.get("fingerprint")
+            if not fp:
+                skipped += 1
+                continue
+            exists = conn.execute(
+                text("SELECT 1 FROM track_fingerprint WHERE fingerprint=:fp LIMIT 1"),
+                {"fp": fp},
+            ).first()
+            if exists:
+                skipped += 1
+                continue
+            conn.execute(
+                text(
+                    """INSERT INTO track_fingerprint
+                           (item_id, recording_mbid, release_group_mbid,
+                            fingerprint, duration_s,
+                            title, artist, album, source, created_at)
+                       VALUES (:id, :rec, :rg, :fp, :dur,
+                               :t, :a, :al, :src, :now)"""
+                ),
+                {
+                    "id": next_id,
+                    "rec": r.get("recording_mbid") or None,
+                    "rg": r.get("release_group_mbid") or None,
+                    "fp": fp,
+                    "dur": float(r.get("duration_s") or 0),
+                    "t": r.get("title") or None,
+                    "a": r.get("artist") or None,
+                    "al": r.get("album") or None,
+                    "src": r.get("source") or "imported",
+                    "now": int(r.get("created_at") or _time.time()),
+                },
+            )
+            inserted += 1
+            next_id -= 1
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "received": len(rows)}
 
 
 @router.post("/clear-mb-ids")
