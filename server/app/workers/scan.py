@@ -72,34 +72,45 @@ async def scan_and_import() -> dict[str, int]:
 
     并发安全：全局 _scan_lock 保证同时只跑一个 scan。第二个调用
     立即返回 skipped 而不是等锁——免得 iOS 下拉刷新累加阻塞.
+
+    walk_audio_files / import_file / detect_pairs / stale cleanup 都是
+    同步 IO, 数 GB 库扫完要几十秒 ~ 几分钟; 直接 await 会堵死事件循环,
+    导致 API stall, 30-min auto-scan 调度被 miss. 整个主体丢 to_thread。
     """
     if _scan_lock.locked():
         log.info("scan: already running, skipping this trigger")
         return {"skipped": True, "reason": "already running"}
 
     async with _scan_lock:
-        return await _do_scan()
+        return await asyncio.to_thread(_do_scan_blocking)
 
 
-async def _do_scan() -> dict[str, int]:
+def _do_scan_blocking() -> dict[str, int]:
     s = get_settings()
     started = time.time()
-    log.info("scan: starting; music_root=%s", s.music_root)
+    roots = s.all_roots
+    log.info("scan: starting; roots=%s", [str(r) for r in roots])
 
     lib = beets_bridge.get_library(s.beets_db, s.music_root)
 
     known = beets_bridge.all_known_paths(lib)
     log.info("scan: %d already in beets", len(known))
 
-    # 先找 CUE+源音频对 —— 这些源音频要 import 但不该指纹（指纹算的是整张专辑，毫无价值）
-    cue_pairs = cuesplit.detect_pairs(s.music_root)
+    # 先找 CUE+源音频对 —— 跨所有 root 扫
+    cue_pairs: list = []
+    for r in roots:
+        cue_pairs.extend(cuesplit.detect_pairs(r))
     cue_src_paths = {p[1].resolve() for p in cue_pairs}
     log.info("scan: 发现 %d 个 CUE+音频对", len(cue_pairs))
 
     stats = beets_bridge.ImportStats()
     new_ids_to_fp: list[int] = []
 
-    for path in walk_audio_files(s.music_root):
+    def _walk_all_roots():
+        for root in roots:
+            yield from walk_audio_files(root)
+
+    for path in _walk_all_roots():
         stats.scanned += 1
         if path in known:
             stats.skipped += 1
@@ -141,8 +152,10 @@ async def _do_scan() -> dict[str, int]:
         )
         log.info("scan: 已排 %d 个 cue_split 任务", len(cue_pairs))
 
-    # 入队压缩档解压任务（zip/rar/7z；已解过的也会进队列，worker 直接收档到 trash）
-    archives_found = archive.detect_archives(s.music_root)
+    # 入队压缩档解压任务（zip/rar/7z）— 跨所有 root
+    archives_found: list = []
+    for r in roots:
+        archives_found.extend(archive.detect_archives(r))
     if archives_found:
         queue.enqueue_many(
             "archive_extract",
@@ -151,6 +164,7 @@ async def _do_scan() -> dict[str, int]:
         log.info("scan: 已排 %d 个 archive_extract 任务", len(archives_found))
 
     # 顺手清掉指向已不存在文件的 stale items (用户可能在 scan 之外删过文件)
+    # 多 root: 相对 path 在任一 root 下能找到就算 OK, 都找不到才删
     stale_removed = 0
     for it in list(lib.items()):
         try:
@@ -159,9 +173,8 @@ async def _do_scan() -> dict[str, int]:
                 p = Path(bytes(raw).decode("utf-8", errors="replace"))
             else:
                 p = Path(str(raw))
-            if not p.is_absolute():
-                p = s.music_root / p
-            if not p.exists():
+            abs_p = s.to_abs(p)
+            if not abs_p.exists():
                 it.remove()
                 stale_removed += 1
         except Exception:  # noqa: BLE001

@@ -14,7 +14,61 @@ class Settings(BaseSettings):
     )
 
     # ── 必填 ──────────────────────────────────────
-    music_root: Path = Field(..., description="音乐库根目录（只读访问）")
+    music_root: Path = Field(..., description="主音乐库根目录（向后兼容必填）")
+    # 多 root 支持: 额外的库根目录, 逗号分隔 (env 是字符串, 拆 csv).
+    # env: MUSIC_ROOTS=/Volumes/NVMe/Music,/Volumes/SSD/Music
+    # 不设 → all_roots = [music_root]
+    # 设了 → all_roots = [music_root, ...额外的] (去重保序)
+    music_roots: str = Field("", description="额外 root, 逗号分隔")
+
+    @property
+    def all_roots(self) -> list[Path]:
+        """实际扫描 / 路径解析时遍历的所有 root, music_root 永远第一个."""
+        extras = [p.strip() for p in self.music_roots.split(",") if p.strip()]
+        seen: set[Path] = set()
+        out: list[Path] = []
+        for r in [self.music_root, *[Path(e) for e in extras]]:
+            try:
+                rr = r.resolve()
+            except Exception:  # noqa: BLE001
+                rr = r
+            if rr in seen:
+                continue
+            seen.add(rr)
+            out.append(r)
+        return out
+
+    def find_root_for(self, path: Path) -> Path | None:
+        """绝对 path 落在哪个 root 下, 找到就返回该 root, 没找到 None."""
+        try:
+            p = path.resolve()
+        except Exception:  # noqa: BLE001
+            p = path
+        for root in self.all_roots:
+            try:
+                rr = root.resolve()
+            except Exception:  # noqa: BLE001
+                rr = root
+            try:
+                p.relative_to(rr)
+                return root
+            except ValueError:
+                continue
+        return None
+
+    def to_abs(self, p: Path | str) -> Path:
+        """item.path 在 DB 里可能存的是相对 (历史遗留) 或绝对. 给一个绝对 Path:
+        - 绝对 → 直接返回
+        - 相对 → 依次拼到每个 root 试 exists(), 命中就返回; 都不在就拼 music_root
+        """
+        pp = Path(p) if not isinstance(p, Path) else p
+        if pp.is_absolute():
+            return pp
+        for root in self.all_roots:
+            cand = root / pp
+            if cand.exists():
+                return cand
+        return self.music_root / pp
     bind_port: int = Field(8000, description="HTTP 监听端口")
 
     # ── 路径 ──────────────────────────────────────
@@ -65,6 +119,8 @@ class Settings(BaseSettings):
     queue_workers: int = 5
     queue_fingerprint_concurrency: int = 3   # AcoustID 3 req/sec 上限
     queue_mb_artist_concurrency: int = 1     # MusicBrainz 1 req/sec 硬限制
+    queue_cue_split_concurrency: int = 4     # ffmpeg 吃 CPU + 磁盘 IO,
+                                             # 太多并行 API 响应会卡
 
     # ── 软删 ──────────────────────────────────────
     trash_retention_days: int = 30

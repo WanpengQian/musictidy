@@ -56,6 +56,11 @@ def _get_kind_sem(kind: str) -> asyncio.Semaphore | None:
             "mb_fetch_artist",
             asyncio.Semaphore(s.queue_mb_artist_concurrency),
         )
+    if kind == "cue_split":
+        return _kind_sems.setdefault(
+            "cue_split",
+            asyncio.Semaphore(s.queue_cue_split_concurrency),
+        )
     return None
 
 

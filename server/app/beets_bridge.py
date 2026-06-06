@@ -75,17 +75,15 @@ def all_known_paths(lib: Any) -> set[Path]:
     取决于 import 时的状态），导致两次 scan 之间路径不一致 → 误报为新文件 → 重复。
     这里强制 absolute + resolve()，保证一致.
     """
-    music_root = Path(
-        lib.directory.decode("utf-8") if isinstance(lib.directory, (bytes, memoryview))
-        else lib.directory
-    )
+    # 多 root: 相对 path 用 settings.to_abs() 跨所有 root 解析
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
     out: set[Path] = set()
     for item in lib.items():
         try:
             p = _from_bytes(item.path)
-            if not p.is_absolute():
-                p = music_root / p
-            out.add(p.resolve())
+            ap = s.to_abs(p)
+            out.add(ap.resolve())
         except Exception:
             pass
     return out
@@ -97,16 +95,12 @@ def dedupe_items_by_path(lib: Any) -> int:
     返回删掉的 item 数。保留每组里 id 最小的（最早 import 的）。
     """
     by_resolved: dict[Path, list] = {}
-    music_root = Path(
-        lib.directory.decode("utf-8") if isinstance(lib.directory, (bytes, memoryview))
-        else lib.directory
-    )
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
     for item in lib.items():
         try:
             p = _from_bytes(item.path)
-            if not p.is_absolute():
-                p = music_root / p
-            p = p.resolve()
+            p = s.to_abs(p).resolve()
         except Exception:
             continue
         by_resolved.setdefault(p, []).append(item)
@@ -208,17 +202,13 @@ def remove_item_by_id(lib: Any, item_id: int) -> bool:
 
 
 def get_item_path(lib: Any, item_id: int) -> Path | None:
-    """item id → 绝对文件 path（beets 存的可能是相对路径，统一规范化）."""
-    music_root = Path(
-        lib.directory.decode("utf-8") if isinstance(lib.directory, (bytes, memoryview))
-        else lib.directory
-    )
+    """item id → 绝对文件 path. 多 root 由 settings.to_abs 解析."""
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
     for it in lib.items(f"id:{item_id}"):
         try:
             p = _from_bytes(it.path)
-            if not p.is_absolute():
-                p = music_root / p
-            return p.resolve()
+            return s.to_abs(p).resolve()
         except Exception:
             return None
     return None

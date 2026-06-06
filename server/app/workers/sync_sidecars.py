@@ -25,6 +25,200 @@ from app.db import get_engine
 
 log = logging.getLogger(__name__)
 
+# 一张正常专辑顶多 ~30 轨; ≥这个数基本是盒装 / 超大精选 / 厂牌大碟。
+_MEGA_RG_TRACKS = 40
+# 文件夹要"拥有"这种 mega 发行的大部分曲目, 才认你是它的主人; 否则八成是
+# AcoustID 把你的曲指纹命中了"恰好也被收进这套大合辑"的录音, 按 filename
+# 序号硬绑进去 = 标题全错 + (镜像碟)重复计数。
+_MEGA_COVERAGE = 0.6
+
+
+def is_incidental_mega_match(total_tracks: int, n_files: int) -> bool:
+    """判定: n_files 个文件被指向一个 total_tracks 轨的发行, 这是不是
+    "指纹偶然命中大合辑里的录音"而非真拥有。
+
+    True = 发行是 mega 合辑/盒装 (≥_MEGA_RG_TRACKS 轨) 且本文件夹只占其中
+    一小撮 (<_MEGA_COVERAGE) → 不该按位置硬绑 (典型: 44 个现场录音文件被吸
+    进 222 轨的《君之頌讚四》盒装)。
+    False = 普通专辑 (哪怕只拥有几轨的残缺专辑, 仍可正常按位置补全)。
+    """
+    if total_tracks < _MEGA_RG_TRACKS:
+        return False
+    return n_files < total_tracks * _MEGA_COVERAGE
+
+
+def unbind_incidental_mega_matches() -> int:
+    """库级 sweep: 任何 item 当前绑在 mega 发行 (≥40 轨) 上、但其所在文件夹只
+    占该发行 <60% → 解绑。
+
+    dominant-per-folder 投票护栏只管"投票投出来的 dominant"; 但有些 item 的
+    mega rg 是 beets 直接打的 MB tag, candidate_rgs 里根本没它, 投票看不见 →
+    护栏够不着 (典型: 陈慧娴[分轨] 17 文件被 beets 直接标成 123 轨《大盛期》)。
+    这个 sweep 直接按"当前绑定 + 文件夹覆盖率"判, 把这类也清掉。
+
+    解绑后 item 退回 owned-albums 的本地兜底文件夹专辑 (仍可见可播)。源文件
+    不动。返回解绑的 item 数。
+    """
+    import json as _json  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
+    from collections import defaultdict as _dd  # noqa: PLC0415
+
+    from app import beets_bridge as _bb  # noqa: PLC0415
+    from app.config import get_settings as _gs  # noqa: PLC0415
+
+    s = _gs()
+    lib = _bb.get_library(s.beets_db, s.music_root)
+    with get_engine().connect() as conn:
+        rows = conn.execute(text(
+            """SELECT i.id, i.path, i.mb_releasegroupid AS rg,
+                      rg.tracks_json AS tj
+               FROM beets.items i
+               JOIN mb_release_group rg ON rg.mbid = i.mb_releasegroupid
+               WHERE i.mb_releasegroupid != '' AND rg.tracks_json IS NOT NULL"""
+        )).all()
+
+    groups: dict[tuple[str, str], list[int]] = _dd(list)
+    rg_total: dict[str, int] = {}
+    for r in rows:
+        raw = r.path
+        p = bytes(raw).decode("utf-8", "replace") \
+            if isinstance(raw, (bytes, memoryview)) else (raw or "")
+        groups[(_os.path.dirname(p), r.rg)].append(int(r.id))
+        if r.rg not in rg_total:
+            try:
+                v = _json.loads(r.tj)
+                rg_total[r.rg] = len(v) if isinstance(v, list) else 0
+            except (TypeError, ValueError):
+                rg_total[r.rg] = 0
+
+    freed = 0
+    for (folder, rg), ids in groups.items():
+        if not is_incidental_mega_match(rg_total.get(rg, 0), len(ids)):
+            continue
+        n = 0
+        for iid in ids:
+            # 只清 rg + track; 保留 artist (见上方护栏同款理由), 让它退回该
+            # 艺人名下的文件夹兜底专辑, 而不是掉进「未识别」。
+            if _bb.set_mb_ids(
+                lib, iid, track_mbid="", releasegroup_mbid="",
+                artist_mbid=None, album_artist_mbid=None, album_artist=None,
+            ):
+                n += 1
+        freed += n
+        log.info(
+            "sync_sidecars[sweep]: 解绑 %s (mega %s %d轨, 本夹 %d文件)",
+            _os.path.basename(folder)[:40], rg[:8], rg_total.get(rg, 0), n,
+        )
+    if freed:
+        log.info("sync_sidecars[sweep]: mega 误绑共解绑 %d 个 item", freed)
+    return freed
+
+
+def ensure_rg_in_cache(rg_mbid: str) -> bool:
+    """确保 mb_release_group 表里有 rg_mbid 这一行 (含 artist FK)。
+
+    owned-albums endpoint 起手就 FROM mb_release_group, 缺这行整张专辑就不
+    显示。item 的 mb_releasegroupid 可能是 beets 导入时直接带的 MB tag, 而
+    server 侧这张缓存表从没为它填过行 —— 那张专辑就凭空消失。这个函数按需
+    从 MB 拉一次补上。
+
+    返回 True = 调用后表里确实有这行 (本来就有 / 这次补上了);
+    返回 False = 补不上 (MB 没 artist-credit / 网络失败), 调用方自行兜底。
+    """
+    import json as _json  # noqa: PLC0415
+    import urllib.request as _ur  # noqa: PLC0415
+
+    with get_engine().connect() as conn:
+        if conn.execute(
+            text("SELECT 1 FROM mb_release_group WHERE mbid=:m"),
+            {"m": rg_mbid},
+        ).first():
+            return True
+    try:
+        url = (f"https://musicbrainz.org/ws/2/release-group/{rg_mbid}"
+               f"?inc=artist-credits&fmt=json")
+        with _ur.urlopen(
+            _ur.Request(url, headers={"User-Agent": "MusicTidy/0.1"}),
+            timeout=15,
+        ) as resp:
+            d = _json.load(resp)
+        ac = (d.get("artist-credit") or [{}])[0].get("artist") or {}
+        artist_mbid = ac.get("id") or ""
+        if not artist_mbid:
+            return False
+        with get_engine().begin() as conn:
+            # mb_artist FK 必须存在
+            if not conn.execute(
+                text("SELECT 1 FROM mb_artist WHERE mbid=:m"), {"m": artist_mbid},
+            ).first():
+                conn.execute(text("""
+                  INSERT OR IGNORE INTO mb_artist
+                    (mbid, name, sort_name, country, disambiguation,
+                     fetched_at, stale_after, genres)
+                  VALUES (:m, :n, :s, :c, :d,
+                          strftime('%s','now'),
+                          strftime('%s','now')+604800, '[]')
+                """), {
+                    "m": artist_mbid,
+                    "n": ac.get("name", ""),
+                    "s": ac.get("sort-name", ""),
+                    "c": ac.get("country", "") or "",
+                    "d": ac.get("disambiguation", "") or "",
+                })
+            conn.execute(text("""
+              INSERT OR IGNORE INTO mb_release_group
+                (mbid, artist_mbid, title, primary_type, secondary_types,
+                 first_release_date)
+              VALUES (:m, :a, :t, :p, :s, :d)
+            """), {
+                "m": rg_mbid, "a": artist_mbid,
+                "t": d.get("title", ""),
+                "p": d.get("primary-type", "") or "",
+                "s": _json.dumps(d.get("secondary-types") or []),
+                "d": d.get("first-release-date", "") or "",
+            })
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def backfill_missing_release_groups(limit: int | None = None) -> dict[str, int]:
+    """扫 beets.items 里所有非空 mb_releasegroupid, 把缓存表里缺的逐个补上。
+
+    专治「item 有 releasegroupid 但 mb_release_group 没这行 → 整张专辑在
+    Browse 里隐身」(典型如张学友: 12 个 item 全在, 但一张专辑都不显示)。
+
+    MB ws/2 限速 1 req/s, 这里每补一个 sleep 1.1s, 所以是慢活、跑后台。
+    返回 {scanned, filled, failed}。
+    """
+    import time as _time  # noqa: PLC0415
+
+    with get_engine().connect() as conn:
+        missing = [r[0] for r in conn.execute(text(
+            """SELECT DISTINCT mb_releasegroupid
+               FROM beets.items
+               WHERE mb_releasegroupid IS NOT NULL
+                 AND mb_releasegroupid != ''
+                 AND mb_releasegroupid NOT IN
+                     (SELECT mbid FROM mb_release_group)"""
+        )).all()]
+    if limit is not None:
+        missing = missing[:limit]
+    filled = failed = 0
+    for i, rg in enumerate(missing):
+        if ensure_rg_in_cache(rg):
+            filled += 1
+        else:
+            failed += 1
+            log.warning("backfill: 补不上 rg=%s", rg)
+        if i < len(missing) - 1:
+            _time.sleep(1.1)  # 尊重 MB 1 req/s
+    log.info(
+        "backfill_missing_release_groups: scanned=%d filled=%d failed=%d",
+        len(missing), filled, failed,
+    )
+    return {"scanned": len(missing), "filled": filled, "failed": failed}
+
 
 def _consolidate_by_folder() -> None:
     """跨同 dir items 的 AcoustID candidate_rgs 求交集 + 投票, 把被错识到
@@ -117,7 +311,7 @@ def _consolidate_by_folder() -> None:
             continue
         pp = _Path(p_str)
         if not pp.is_absolute():
-            pp = music_root / pp
+            pp = s.to_abs(pp)
         d = _os.path.dirname(str(pp))
         by_dir[d].append({
             "id": int(r.id),
@@ -129,61 +323,8 @@ def _consolidate_by_folder() -> None:
     _rg_tracks: dict[str, list[dict]] = {}
 
     def _ensure_rg_in_cache(rg_mbid: str) -> None:
-        """确保 mb_release_group 表有 rg 行 (含 artist FK). owned-albums
-        endpoint 起手就 FROM mb_release_group, 缺这行就整张专辑不显示。"""
-        with get_engine().connect() as conn:
-            exists = conn.execute(_text(
-                "SELECT 1 FROM mb_release_group WHERE mbid=:m"
-            ), {"m": rg_mbid}).first()
-        if exists:
-            return
-        try:
-            import urllib.request as _ur  # noqa: PLC0415
-            url = (f"https://musicbrainz.org/ws/2/release-group/{rg_mbid}"
-                   f"?inc=artist-credits&fmt=json")
-            with _ur.urlopen(
-                _ur.Request(url, headers={"User-Agent": "MusicTidy/0.1"}),
-                timeout=15,
-            ) as resp:
-                d = _json.load(resp)
-            ac = (d.get("artist-credit") or [{}])[0].get("artist") or {}
-            artist_mbid = ac.get("id") or ""
-            if not artist_mbid:
-                return
-            with get_engine().begin() as conn:
-                # mb_artist FK 必须存在
-                has = conn.execute(_text(
-                    "SELECT 1 FROM mb_artist WHERE mbid=:m"
-                ), {"m": artist_mbid}).first()
-                if not has:
-                    conn.execute(_text("""
-                      INSERT OR IGNORE INTO mb_artist
-                        (mbid, name, sort_name, country, disambiguation,
-                         fetched_at, stale_after, genres)
-                      VALUES (:m, :n, :s, :c, :d,
-                              strftime('%s','now'),
-                              strftime('%s','now')+604800, '[]')
-                    """), {
-                        "m": artist_mbid,
-                        "n": ac.get("name", ""),
-                        "s": ac.get("sort-name", ""),
-                        "c": ac.get("country", "") or "",
-                        "d": ac.get("disambiguation", "") or "",
-                    })
-                conn.execute(_text("""
-                  INSERT OR IGNORE INTO mb_release_group
-                    (mbid, artist_mbid, title, primary_type, secondary_types,
-                     first_release_date)
-                  VALUES (:m, :a, :t, :p, :s, :d)
-                """), {
-                    "m": rg_mbid, "a": artist_mbid,
-                    "t": d.get("title", ""),
-                    "p": d.get("primary-type", "") or "",
-                    "s": _json.dumps(d.get("secondary-types") or []),
-                    "d": d.get("first-release-date", "") or "",
-                })
-        except Exception:  # noqa: BLE001
-            pass
+        # 委托给模块级实现 (backfill endpoint 也复用同一份, 避免两处逻辑漂移)
+        ensure_rg_in_cache(rg_mbid)
 
     def _get_tracks(rg_mbid: str) -> list[dict]:
         if rg_mbid in _rg_tracks:
@@ -384,6 +525,34 @@ def _consolidate_by_folder() -> None:
         _ensure_rg_in_cache(dominant)  # owned-albums endpoint 起手就 FROM 这表
         dom_tracks = _get_tracks(dominant)
 
+        # 护栏: dominant 是 mega 合辑/盒装, 但本文件夹只占其中一小撮 → 这是
+        # AcoustID 把你的曲指纹命中了"恰好也收进这套大合辑"的录音, 并非你真
+        # 拥有这套盒装。按 filename 序号硬绑进 222 轨盒装 = 标题全错 + 重复
+        # 计数。拒绝绑定; 已经被错绑到它上面的 item 顺手解绑, 退回文件夹兜底
+        # 专辑 (owned-albums 的本地兜底让它仍可见可播)。源文件不动。
+        if dom_tracks and is_incidental_mega_match(len(dom_tracks), len(items)):
+            freed = 0
+            for it in items:
+                if it["rg"] == dominant:
+                    # 只清 rg + track 绑定; 保留 artist —— 这是单艺人文件夹, 艺人
+                    # 本来就对 (mega rg 的主艺人 = 该艺人), 清掉会让整夹掉进
+                    # 「未识别」, 而不是退回该艺人名下的文件夹兜底专辑。
+                    ok = _bb.set_mb_ids(
+                        lib, it["id"],
+                        track_mbid="", releasegroup_mbid="",
+                        artist_mbid=None, album_artist_mbid=None, album_artist=None,
+                    )
+                    if ok:
+                        freed += 1
+            short = d.replace(str(music_root), "").lstrip("/")
+            log.info(
+                "sync_sidecars: %s 拒绝吸进 mega RG %s (%d 轨, 本夹仅 %d 文件), "
+                "解绑 %d", short[:50], dominant[:8], len(dom_tracks), len(items),
+                freed,
+            )
+            total_changed += freed
+            continue
+
         # dominant rg 的主艺人 → mb_albumartistid 必须等于这个值。
         # AcoustID 对合唱曲会把合作艺人 (而不是专辑主艺人) 塞到 album_artist_mbid,
         # 害得「孙燕姿」(等合唱者) 的 Browse 页里冒出张惠妹的专辑。修法:
@@ -405,8 +574,10 @@ def _consolidate_by_folder() -> None:
                 p_str = bytes(raw).decode("utf-8", errors="replace")
             else:
                 p_str = str(raw or "")
-            if not _Path(p_str).is_absolute():
-                p_str = str(music_root / p_str)
+            pp = _Path(p_str)
+            if not pp.is_absolute():
+                pp = s.to_abs(pp)
+                p_str = str(pp)
             item_path[iid] = (_os.path.basename(p_str), _disc_from_path(p_str))
 
         # 拿当前 dir 每个 item 现绑的 rec_mbid + albumartist_mbid
@@ -486,6 +657,13 @@ def _consolidate_by_folder() -> None:
     if total_changed:
         log.info("sync_sidecars: dominant-per-folder 共改了 %d 个 item", total_changed)
 
+    # 库级 sweep: 投票护栏够不着的 mega 误绑 (beets 直接打的 MB tag,
+    # candidate_rgs 里没这个 rg) 在这里按"当前绑定 + 覆盖率"兜底解绑。
+    try:
+        total_changed += unbind_incidental_mega_matches()
+    except Exception:  # noqa: BLE001
+        log.exception("sync_sidecars: mega sweep 失败 (不影响其余)")
+
     # 全局 normalize: 任何 item 只要绑了 rg, 它的 mb_albumartistid 必须等于
     # 该 rg 在 mb_release_group 里的主艺人 mbid. 这条独立于 dominant-per-folder
     # — best-of compilation dir 每曲散在不同 album rg 没 dominant, 合唱曲
@@ -564,16 +742,16 @@ async def handle_sync_sidecars(payload: dict[str, Any]) -> None:  # noqa: ARG001
             return bytes(p).decode("utf-8", errors="replace")
         return p or ""
 
-    # beets 可能存相对路径 (相对 library.directory) → 自己加上 music_root
+    # beets 可能存相对路径 → 多 root 用 settings.to_abs() 解析
     from app.config import get_settings  # noqa: PLC0415
-    music_root = get_settings().music_root
+    _sx = get_settings()
 
     def _abs(p_str: str) -> str:
         if not p_str:
             return ""
         pp = Path(p_str)
         if not pp.is_absolute():
-            pp = music_root / pp
+            pp = _sx.to_abs(pp)
         return str(pp)
 
     by_dir: dict[str, dict] = defaultdict(lambda: {

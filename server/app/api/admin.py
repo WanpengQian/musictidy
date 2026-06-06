@@ -83,6 +83,55 @@ async def trigger_scan() -> dict:
     return {"ok": True, "note": "scan started in background; watch /api/v1/admin/stats"}
 
 
+_running_backfills: set[asyncio.Task] = set()
+
+
+@router.post("/backfill-release-groups")
+async def backfill_release_groups() -> dict:
+    """补 mb_release_group 缓存里缺的行。
+
+    症状: item 有 mb_releasegroupid (beets 导入时带的 MB tag), 但 server 的
+    mb_release_group 缓存表从没为它填过行 → owned-albums 起手 FROM 这张表,
+    命不中 → 整张专辑在 Browse 里隐身 (典型: 张学友 12 个 item 全在却一张
+    专辑不显示)。
+
+    扫所有非空 releasegroupid, 把缺的逐个从 MB 拉回补上。MB 限速 1 req/s,
+    所以慢、跑后台; 缺多少先返回, 跑完看 /api/v1/admin/stats 的 mb_cache。
+    """
+    from app.workers.sync_sidecars import (  # noqa: PLC0415
+        backfill_missing_release_groups,
+    )
+
+    if any(not t.done() for t in _running_backfills):
+        return {"ok": False, "reason": "backfill already running"}
+
+    with get_engine().connect() as conn:
+        missing = int(conn.execute(text(
+            """SELECT COUNT(DISTINCT mb_releasegroupid)
+               FROM beets.items
+               WHERE mb_releasegroupid IS NOT NULL
+                 AND mb_releasegroupid != ''
+                 AND mb_releasegroupid NOT IN
+                     (SELECT mbid FROM mb_release_group)"""
+        )).scalar() or 0)
+
+    if missing == 0:
+        return {"ok": True, "missing": 0, "note": "缓存已齐, 没活可干"}
+
+    # 同步 + sleep 的活, 丢线程跑, 别堵 event loop
+    task = asyncio.create_task(
+        asyncio.to_thread(backfill_missing_release_groups), name="backfill-rg",
+    )
+    _running_backfills.add(task)
+    task.add_done_callback(_running_backfills.discard)
+    return {
+        "ok": True,
+        "missing": missing,
+        "note": f"补 {missing} 个 rg, 后台跑 (约 {missing} 秒, MB 限速 1/s); "
+                "完事看 /api/v1/admin/stats",
+    }
+
+
 @router.get("/queue")
 async def queue_status() -> dict:
     """队列里各 kind × status 的计数."""

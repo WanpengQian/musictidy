@@ -3028,14 +3028,23 @@ async def owned_albums(mbid: str) -> dict:
                     f"https://coverartarchive.org/release-group/{d['mbid']}/front-500"
             result.append(d)
 
-        # —— 本地兜底：artist 命中、但 release-group 没识别的 items ——
+        # —— 本地兜底：artist 命中, 但在上面 MB 专辑路里没出数的 items ——
+        # 收两种:
+        #   1) mb_releasegroupid 为空 (压根没识别)
+        #   2) releasegroupid 非空, 但 mb_release_group 缓存表里没这行 —— 这种
+        #      item 卡在死角: MB 专辑路 EXISTS 命不中 (缺缓存行), 旧版本兜底又只
+        #      收空 releasegroupid → 整张专辑凭空消失 (典型: 张学友 12 个 item
+        #      全在却一张专辑都不显示)。backfill 补缓存是正解, 这里是补不上时的网。
         local_items = conn.execute(
             text(
                 """SELECT id, path, album, title, format, bitrate, length
                    FROM beets.items
                    WHERE COALESCE(NULLIF(mb_albumartistid, ''),
                                   mb_artistid) = :m
-                     AND (mb_releasegroupid IS NULL OR mb_releasegroupid = '')"""
+                     AND (mb_releasegroupid IS NULL
+                          OR mb_releasegroupid = ''
+                          OR mb_releasegroupid NOT IN
+                             (SELECT mbid FROM mb_release_group))"""
             ),
             {"m": mbid},
         ).all()
@@ -3080,3 +3089,67 @@ async def owned_albums(mbid: str) -> dict:
         "albums": result,
         "loose_items": loose,
     }
+
+
+# ── 歌词 ────────────────────────────────────────────────────────
+# 按 recording_mbid 缓存. 流程:
+#   1. GET → 缓存命中返回 lrc/plain; miss 时若 query try_lrclib=1 再尝试 lrclib
+#      (英文流行命中率高, 繁体中文老歌 lrclib 基本 miss → 走粘贴流程)
+#   2. POST → 用户在 iOS 端截图 + OCR + AI 整理后灌进来, 覆盖缓存
+#   3. DELETE → 清缓存, 让用户重抓
+@router.get("/recordings/{recording_mbid}/lyrics")
+async def get_lyrics(recording_mbid: str, try_lrclib: int = 0) -> dict:
+    from app import lyrics_db  # noqa: PLC0415
+    cached = lyrics_db.get(recording_mbid)
+    if cached and (cached["lrc"] or cached["plain"]):
+        return {**cached, "recording_mbid": recording_mbid}
+    if try_lrclib:
+        # 拿 artist/title/album/duration 给 lrclib (从 fingerprint cache)
+        with get_engine().connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT artist, title, album, duration_s "
+                    "FROM track_fingerprint "
+                    "WHERE recording_mbid=:m LIMIT 1"
+                ),
+                {"m": recording_mbid},
+            ).first()
+        if row and row.artist and row.title:
+            hit = await lyrics_db.fetch_lrclib(
+                artist=row.artist or "",
+                title=row.title or "",
+                album=row.album or "",
+                duration_s=float(row.duration_s or 0),
+            )
+            if hit:
+                lyrics_db.save(
+                    recording_mbid,
+                    lrc=hit.get("lrc", ""),
+                    plain=hit.get("plain", ""),
+                    source=hit.get("source", "lrclib"),
+                )
+                return {**hit, "recording_mbid": recording_mbid}
+    raise HTTPException(404, detail="no lyrics for this recording")
+
+
+@router.post("/recordings/{recording_mbid}/lyrics")
+async def save_lyrics(recording_mbid: str, payload: dict) -> dict:
+    """用户粘贴 / iOS 端 AI 整理后的歌词灌进来. payload: {lrc?, plain?, source?}"""
+    from app import lyrics_db  # noqa: PLC0415
+    lrc = (payload.get("lrc") or "").strip()
+    plain = (payload.get("plain") or "").strip()
+    if not lrc and not plain:
+        raise HTTPException(400, detail="lrc or plain required")
+    source = (payload.get("source") or "manual").strip() or "manual"
+    lyrics_db.save(recording_mbid, lrc=lrc, plain=plain, source=source)
+    return {"ok": True, "recording_mbid": recording_mbid, "source": source}
+
+
+@router.delete("/recordings/{recording_mbid}/lyrics")
+async def delete_lyrics(recording_mbid: str) -> dict:
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("DELETE FROM track_lyrics WHERE recording_mbid=:m"),
+            {"m": recording_mbid},
+        )
+    return {"ok": True}

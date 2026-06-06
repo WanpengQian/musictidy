@@ -23,8 +23,9 @@ async def lifespan(_app: FastAPI):
     s.ensure_dirs()
     run_migrations()
 
-    from app import fingerprint_db  # noqa: PLC0415
+    from app import fingerprint_db, lyrics_db  # noqa: PLC0415
     fingerprint_db.ensure_table()
+    lyrics_db.ensure_table()
 
     # 注册 task_queue handlers，然后启 scheduler + drain loop
     from app.workers import (  # noqa: PLC0415
