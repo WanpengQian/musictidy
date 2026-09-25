@@ -32,6 +32,13 @@ _MEGA_RG_TRACKS = 40
 # 序号硬绑进去 = 标题全错 + (镜像碟)重复计数。
 _MEGA_COVERAGE = 0.6
 
+# 按位置绑定时, 文件实测时长 vs 目标轨 canonical 时长 允许的最大差 (秒)。
+# 同一 recording 不同版本一般只差几秒; 不同歌往往差几十秒。
+_DUR_TOL_S = 15.0
+# 文件夹里带序号的文件, 至少这个比例能在 dominant 对应位置找到时长吻合的轨,
+# 才认 dominant 选对。低于此 → dominant 多半是指纹污染选错的, 整夹别绑。
+_DUR_MIN_AGREE = 0.5
+
 
 def is_incidental_mega_match(total_tracks: int, n_files: int) -> bool:
     """判定: n_files 个文件被指向一个 total_tracks 轨的发行, 这是不是
@@ -418,15 +425,6 @@ def _consolidate_by_folder() -> None:
                 return int(m.group(1))
         return 1
 
-    def _tracks_lookup(tracks: list[dict], disc: int, pos: int) -> str:
-        """按 (disc, pos) 在 tracks_json 里找 recording_mbid."""
-        for t in tracks:
-            td = int(t.get("disc", 1) or 1)
-            tp = int(t.get("position") or 0)
-            if td == disc and tp == pos:
-                return t.get("recording_mbid") or ""
-        return ""
-
     # 先一次性拉所有 item 的 track-level artist (V.A. dir 检测用).
     # 用 track_fingerprint.artist (AcoustID 缓存的原始 artist name) 而不是
     # beets.items.mb_artistid — 后者可能被前一次 V.A. 规则清空, 反复 sync
@@ -553,6 +551,12 @@ def _consolidate_by_folder() -> None:
             total_changed += freed
             continue
 
+        # (disc,pos) → canonical track, 给"按位置补 rec"和下面的时长校验用
+        dom_by_pos = {
+            (int(t.get("disc", 1) or 1), int(t.get("position") or 0)): t
+            for t in dom_tracks
+        }
+
         # dominant rg 的主艺人 → mb_albumartistid 必须等于这个值。
         # AcoustID 对合唱曲会把合作艺人 (而不是专辑主艺人) 塞到 album_artist_mbid,
         # 害得「孙燕姿」(等合唱者) 的 Browse 页里冒出张惠妹的专辑。修法:
@@ -580,18 +584,51 @@ def _consolidate_by_folder() -> None:
                 p_str = str(pp)
             item_path[iid] = (_os.path.basename(p_str), _disc_from_path(p_str))
 
-        # 拿当前 dir 每个 item 现绑的 rec_mbid + albumartist_mbid
+        # 拿当前 dir 每个 item 现绑的 rec_mbid + albumartist_mbid + 实测时长
         item_curr_rec: dict[int, str] = {}
         item_curr_aa: dict[int, str] = {}
+        item_len: dict[int, float] = {}
         with get_engine().connect() as conn:
             ids = [it["id"] for it in items]
             from sqlalchemy import bindparam as _bp  # noqa: PLC0415
             stmt = _text(
-                "SELECT id, mb_trackid, mb_albumartistid FROM beets.items WHERE id IN :ids"
+                "SELECT id, mb_trackid, mb_albumartistid, length "
+                "FROM beets.items WHERE id IN :ids"
             ).bindparams(_bp("ids", expanding=True))
             for row in conn.execute(stmt, {"ids": ids}):
                 item_curr_rec[int(row.id)] = row.mb_trackid or ""
                 item_curr_aa[int(row.id)] = row.mb_albumartistid or ""
+                item_len[int(row.id)] = float(row.length or 0)
+
+        # —— 时长一致性护栏 ——
+        # dominant 选对的话, 文件夹里带序号的文件应该大多能在 dominant 对应位置
+        # 找到时长吻合的轨。吻合率太低 → dominant 多半是指纹污染选错的 (典型:
+        # 牵手 rip 被一批假 manual 指纹投成阿密特, 按位置硬绑后整张专辑放错歌)。
+        # 这种整夹跳过, 别把别的专辑的歌按位置塞进来。
+        agree = positioned = 0
+        for it in items:
+            pinfo = item_path.get(it["id"])
+            if not pinfo:
+                continue
+            pos = _filename_position(pinfo[0])
+            if pos is None:
+                continue
+            cand = dom_by_pos.get((pinfo[1], pos))
+            if not cand:
+                continue
+            positioned += 1
+            cl = float(cand.get("length_s") or 0)
+            fl = item_len.get(it["id"], 0.0)
+            if cl > 0 and fl > 0 and abs(cl - fl) <= _DUR_TOL_S:
+                agree += 1
+        if positioned >= 3 and agree < positioned * _DUR_MIN_AGREE:
+            short = d.replace(str(music_root), "").lstrip("/")
+            log.info(
+                "sync_sidecars: %s 时长不吻合 dominant %s (%d/%d 对得上), "
+                "判为指纹污染选错, 跳过不绑", short[:50], dominant[:8],
+                agree, positioned,
+            )
+            continue
 
         # dominant 自己是 Compilation → 整 dir 就是合集本身, 应该把所有
         # item 都拉到 dominant 上 (包括当前指向另一张 Album rg 的那些).
@@ -622,16 +659,24 @@ def _consolidate_by_folder() -> None:
                 and not strong_dominant):
                 continue
 
-            # 按 (disc, position) 试补 rec_mbid (双 CD 专辑要区分 disc)
+            # 按 (disc, position) 试补 rec_mbid (双 CD 专辑要区分 disc)。
+            # 但要过时长校验: 目标轨 canonical 时长跟文件实测差太多 → 这文件按
+            # 位置根本不对应这一轨 (指纹污染/错位), 整条跳过别绑, 免得放错歌。
             rec_for_item: str = cur_rec
             path_info = item_path.get(it["id"])
             if path_info and dom_tracks:
                 fname, disc = path_info
                 pos = _filename_position(fname)
                 if pos is not None:
-                    pos_rec = _tracks_lookup(dom_tracks, disc, pos)
-                    if pos_rec:
-                        rec_for_item = pos_rec
+                    cand = dom_by_pos.get((disc, pos))
+                    if cand:
+                        cl = float(cand.get("length_s") or 0)
+                        fl = item_len.get(it["id"], 0.0)
+                        if cl > 0 and fl > 0 and abs(cl - fl) > _DUR_TOL_S:
+                            continue  # 时长对不上, 不把这文件绑到 dominant 这轨
+                        pos_rec = cand.get("recording_mbid") or ""
+                        if pos_rec:
+                            rec_for_item = pos_rec
 
             # 已经在 dominant 且 rec 没变 且 aa 也对 → 不调用 (省一次 IO)
             if cur == dominant and rec_for_item == cur_rec and not aa_wrong:

@@ -9,6 +9,7 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
+import re
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, text
@@ -99,12 +100,22 @@ def session_scope() -> Generator[Session, None, None]:
         s.close()
 
 
+def _is_add_column(stmt: str) -> bool:
+    body = "\n".join(ln for ln in stmt.splitlines() if not ln.strip().startswith("--"))
+    return bool(re.search(r"\bALTER\s+TABLE\b.*\bADD\s+COLUMN\b", body, re.I | re.S))
+
+
 def run_migrations() -> None:
     """跑 migrations/*.sql。极简：按文件名顺序 exec。"""
     engine = get_engine()
     migrations_dir = Path(__file__).parent.parent / "migrations"
     if not migrations_dir.exists():
         return
+    # 部分迁移 (009/010) 要 ALTER / 建索引 track_fingerprint, 但这表由 ensure_table 建;
+    # 全新库先把它建出来, 不然启动直接挂 (fresh install / demo 重建都会踩)
+    from app import fingerprint_db  # noqa: PLC0415
+
+    fingerprint_db.ensure_table()
 
     # 记录已跑过的
     with engine.begin() as conn:
@@ -127,8 +138,20 @@ def run_migrations() -> None:
                 continue
             sql = path.read_text()
             for stmt in sql.split(";\n"):
-                if stmt.strip():
-                    conn.execute(text(stmt))
+                if not stmt.strip():
+                    continue
+                if _is_add_column(stmt):
+                    # ADD COLUMN 的表 (如 track_fingerprint) 由 ensure_table() 运行时建/补列:
+                    # 全新库时表还不存在, 旧库时列可能已补 —— 两种都跳过, 别让启动挂掉
+                    try:
+                        with conn.begin_nested():
+                            conn.execute(text(stmt))
+                    except Exception as e:  # noqa: BLE001
+                        msg = str(e).lower()
+                        if "no such table" not in msg and "duplicate column" not in msg:
+                            raise
+                    continue
+                conn.execute(text(stmt))
             conn.execute(
                 text(
                     "INSERT INTO schema_migrations (filename, applied_at) "

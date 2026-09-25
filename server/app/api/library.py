@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import text
 
+from app import sort_keys
 from app.db import get_engine
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ SORT_CLAUSES: dict[str, str] = {
     "owned": "owned DESC, total DESC",
     "alpha": "sort_name IS NULL, sort_name ASC",
     "items": "items_count DESC",
+    # 最近添加: 该艺人名下最新入库的文件时间 (beets.items.added) 降序
+    "added": "last_added DESC",
 }
 
 # MusicBrainz 的"群星合集"虚拟艺人，不算独立艺人
@@ -182,7 +185,9 @@ def _list_artists_rows(
             COUNT(*) AS items_count,
             -- 文件 tag 里的 albumartist 作为兜底名字。MB 还没 fetch 时立刻
             -- 显示出来；mb_artist.name 一旦拉到就会覆盖。
-            MAX(COALESCE(NULLIF(albumartist, ''), artist)) AS raw_name
+            MAX(COALESCE(NULLIF(albumartist, ''), artist)) AS raw_name,
+            -- 该艺人名下最新入库文件的时间, 给"最近添加"排序用
+            MAX(added) AS last_added
         FROM beets.items
         WHERE COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != ''
           AND COALESCE(NULLIF(mb_albumartistid, ''), mb_artistid) != '{VARIOUS_ARTISTS_MBID}'
@@ -213,6 +218,7 @@ def _list_artists_rows(
              ELSE NULL END     AS completeness,
         COALESCE(NULLIF(a.name, ''), la.raw_name) AS name,
         COALESCE(NULLIF(a.sort_name, ''), la.raw_name) AS sort_name,
+        la.last_added,
         a.country,
         -- 让 iOS 端能区分"已是 MB 名"和"还在 fetch 中的临时名"，等 fetch 完会自动覆盖
         (a.name IS NULL OR a.name = '') AS mb_pending
@@ -242,7 +248,17 @@ def _list_artists_rows(
         # SQLite 把 BOOLEAN 表达式返回为 0/1 int —— iOS Swift Bool decoder 不吃，转成 bool
         if "mb_pending" in m:
             m["mb_pending"] = bool(m["mb_pending"])
+        # 本地化排序 key + 索引字母 (中文拼音 / 日文五十音 / 西文拉丁), 客户端直接用
+        _sk, m["index_letter"] = sort_keys.compute(
+            m.get("name"), m.get("sort_name"), m.get("country")
+        )
         out.append(m)
+
+    # 字母排序: MB 的 sort_name 是英文罗马字(粤/普混用不一致), 这里用本地化 key
+    # 在 server 端统一重排, iOS / web 拿到的就是正确顺序, 不用各自再排。
+    if sort == "alpha":
+        out.sort(key=lambda m: sort_keys.compute(
+            m.get("name"), m.get("sort_name"), m.get("country"))[0])
 
     # 末尾追加"未识别"虚拟艺人 —— 完全没 mb_artistid/mb_albumartistid 的 items
     # （fingerprint 全失败、beets 没回填 tag）。让用户看得到这堆，能去整理
@@ -263,6 +279,7 @@ def _list_artists_rows(
                 "sort_name": "~~~",
                 "country": "",
                 "mb_pending": False,
+                "index_letter": "#",
             })
     except Exception:
         pass
@@ -272,7 +289,7 @@ def _list_artists_rows(
 
 @router.get("/artists")
 async def list_artists(
-    sort: str = Query("completeness", regex="^(completeness|owned|alpha|items)$"),
+    sort: str = Query("completeness", regex="^(completeness|owned|alpha|items|added)$"),
     filter: str = Query("all", regex="^(all|incomplete|complete|no_mb_cache)$"),
 ) -> dict:
     rows = _list_artists_rows(sort, filter)
