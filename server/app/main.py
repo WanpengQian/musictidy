@@ -115,20 +115,17 @@ def create_app() -> FastAPI:
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     # JSON API
-    from app.api import admin, auth as auth_api, library, playlist, wishlist  # noqa: PLC0415
+    from app.api import admin, auth as auth_api, inbox, library, playlist, wishlist  # noqa: PLC0415
 
     app.include_router(auth_api.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
+    app.include_router(inbox.router, prefix="/api/v1/inbox", tags=["inbox"])
     app.include_router(library.router, prefix="/api/v1", tags=["library"])
     app.include_router(playlist.router, prefix="/api/v1", tags=["playlist"])
     app.include_router(wishlist.router, prefix="/api/v1", tags=["wishlist"])
 
-    # HTML 路由（dashboard）
-    from app.api import web  # noqa: PLC0415
-
-    app.include_router(web.router, tags=["web"])
-
-    # TODO P2: from app.api import curation; app.include_router(...)
+    # 旧 Jinja dashboard 已退休 —— 管理/播放全部走 SPA (root mount, 见下)。
+    # 需要时可临时挂回: from app.api import web; app.include_router(web.router)
 
     @app.get("/healthz", response_class=JSONResponse)
     async def healthz():
@@ -166,6 +163,28 @@ def create_app() -> FastAPI:
             str(s.server_logo_path),
             # 一天 cache 足够；改 logo 不是热操作
             headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    # 管理者「整理」SPA —— 服务器 root 直接伺候。
+    # 注意: root "/" 给的是 organizer.html (整理/管理 app), 不是 index.html
+    # (那是终端用户的播放器, 走 CF Pages / app.musictidy.com)。两个 app 分开。
+    # 同源调 /api, 免 CORS、免配 server URL。
+    spa_dir = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+    if spa_dir.exists():
+        from fastapi.responses import FileResponse  # noqa: PLC0415
+
+        organizer_html = spa_dir / "organizer.html"
+
+        @app.get("/", include_in_schema=False)
+        async def _organizer_root():
+            target = organizer_html if organizer_html.exists() else spa_dir / "index.html"
+            return FileResponse(str(target), headers={"Cache-Control": "no-store"})
+
+        # 其余静态 (assets/ 等) catch-all, 必须最后挂; /api/* 和 / 已先注册优先匹配。
+        app.mount("/", StaticFiles(directory=str(spa_dir), html=True), name="spa")
+    else:
+        logging.getLogger("app.main").warning(
+            "SPA dist 不存在 (%s) —— 先 `cd web && npm run build`", spa_dir
         )
 
     return app

@@ -13,6 +13,7 @@ items 是不是绑到一致的 rg 一目了然, 不会写出半成品 sidecar。
 from __future__ import annotations
 
 import logging
+import re
 import os as _os
 from collections import defaultdict
 from pathlib import Path
@@ -54,6 +55,19 @@ def is_incidental_mega_match(total_tracks: int, n_files: int) -> bool:
     return n_files < total_tracks * _MEGA_COVERAGE
 
 
+# 多碟专辑整理进 Library 时拆成 `专辑/Disc 1/`、`Disc 2/` … 子目录; mega 护栏算
+# "本文件夹占发行多少" 必须按整张专辑算, 不然 3 碟 50 首的《最紅》(62 轨) 每碟 16-18
+# 首都 <60%, 整张被当成误绑解绑。
+_DISC_SUBDIR_RE = re.compile(r"^(?:disc|cd|disk)\s*\d+$", re.IGNORECASE)
+
+
+def album_folder_of(folder: str) -> str:
+    """`…/最紅/Disc 2` → `…/最紅`; 非碟号子目录原样返回。"""
+    import os as _os  # noqa: PLC0415
+
+    return _os.path.dirname(folder) if _DISC_SUBDIR_RE.match(_os.path.basename(folder)) else folder
+
+
 def unbind_incidental_mega_matches() -> int:
     """库级 sweep: 任何 item 当前绑在 mega 发行 (≥40 轨) 上、但其所在文件夹只
     占该发行 <60% → 解绑。
@@ -90,7 +104,7 @@ def unbind_incidental_mega_matches() -> int:
         raw = r.path
         p = bytes(raw).decode("utf-8", "replace") \
             if isinstance(raw, (bytes, memoryview)) else (raw or "")
-        groups[(_os.path.dirname(p), r.rg)].append(int(r.id))
+        groups[(album_folder_of(_os.path.dirname(p)), r.rg)].append(int(r.id))
         if r.rg not in rg_total:
             try:
                 v = _json.loads(r.tj)
@@ -441,6 +455,9 @@ def _consolidate_by_folder() -> None:
                 item_artists[int(row.item_id)] = (row.artist or "").strip().lower()
 
     total_changed = 0
+    album_files: dict[str, int] = _dd(int)     # 整张专辑 (合并 Disc N 子目录) 的文件数
+    for d, items in by_dir.items():
+        album_files[album_folder_of(d)] += len(items)
     for d, items in by_dir.items():
         if len(items) < 3:
             continue
@@ -528,7 +545,7 @@ def _consolidate_by_folder() -> None:
         # 拥有这套盒装。按 filename 序号硬绑进 222 轨盒装 = 标题全错 + 重复
         # 计数。拒绝绑定; 已经被错绑到它上面的 item 顺手解绑, 退回文件夹兜底
         # 专辑 (owned-albums 的本地兜底让它仍可见可播)。源文件不动。
-        if dom_tracks and is_incidental_mega_match(len(dom_tracks), len(items)):
+        if dom_tracks and is_incidental_mega_match(len(dom_tracks), album_files[album_folder_of(d)]):
             freed = 0
             for it in items:
                 if it["rg"] == dominant:

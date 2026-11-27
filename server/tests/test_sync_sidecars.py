@@ -29,3 +29,15 @@ from app.workers.sync_sidecars import is_incidental_mega_match
 )
 def test_is_incidental_mega_match(total_tracks, n_files, expected):
     assert is_incidental_mega_match(total_tracks, n_files) is expected
+
+
+def test_mega_guard_counts_whole_multi_disc_album():
+    """Library 里多碟专辑拆成 Disc N 子目录; 护栏要按整张专辑算覆盖率,
+    否则 3 碟 50 首的 62 轨专辑每碟都 <60% 被误解绑。"""
+    from app.workers.sync_sidecars import album_folder_of, is_incidental_mega_match
+
+    assert album_folder_of("/L/張國榮/最紅/Disc 2") == "/L/張國榮/最紅"
+    assert album_folder_of("/L/x/CD1") == "/L/x"
+    assert album_folder_of("/L/張國榮/最紅") == "/L/張國榮/最紅"
+    assert is_incidental_mega_match(62, 18)          # 单碟子目录单独算会误判
+    assert not is_incidental_mega_match(62, 50)      # 整张专辑算就不会

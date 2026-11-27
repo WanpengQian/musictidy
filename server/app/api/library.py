@@ -2198,7 +2198,7 @@ async def artist_photo(mbid: str):
 
     if cache_path.exists() and cache_path.stat().st_size > 0:
         cache_path.touch()
-        return FileResponse(cache_path, media_type="image/jpeg")
+        return FileResponse(cache_path, media_type=_sniff_image_media_type(cache_path))
 
     # TheAudioDB —— test key "2" 够用；正式部署可换自己的 key
     api_url = f"https://www.theaudiodb.com/api/v1/json/2/artist-mb.php?i={mbid}"
@@ -2230,8 +2230,71 @@ async def artist_photo(mbid: str):
     return FileResponse(cache_path, media_type="image/jpeg")
 
 
-def _write_artist_photo_into_dirs(mbid: str, data: bytes, music_root: PPath) -> None:
-    """通过 beets 数据找该艺人所有曲目，取 track.parent.parent 当作 artist dir。"""
+@router.post("/artists/{mbid}/photo/upload")
+async def upload_artist_photo(mbid: str, file: UploadFile = File(...)) -> dict:
+    """用户自己给艺人换照片 (手机相册 / Google 搜图裁剪后上传).
+
+    直接覆盖 data/artist_photos/{mbid}.jpg —— GET /artists/{mbid}/photo 命中缓存
+    就不会再去 TheAudioDB 拉, 所以用户传的图永远优先。文件名固定 .jpg,
+    真实格式由 GET 时 magic-byte 嗅探决定 media_type。
+    开了 allow_file_writes 时同时把 artist.jpg 写进该艺人目录 (覆盖旧的)。
+    """
+    import logging  # noqa: PLC0415
+
+    from app.config import get_settings  # noqa: PLC0415
+
+    if mbid == NO_ARTIST_MBID:
+        raise HTTPException(400, detail="orphan bucket has no artist photo")
+
+    log = logging.getLogger(__name__)
+    s = get_settings()
+    cache_dir = s.data_dir / "artist_photos"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, detail="empty upload")
+    if _sniff_image_media_type(data) is None:
+        raise HTTPException(400, detail="not an image (jpeg/png/webp)")
+
+    cache_path = cache_dir / f"{mbid}.jpg"
+    cache_path.write_bytes(data)
+    log.info("custom artist photo mbid=%s (%d KB)", mbid, len(data) // 1024)
+
+    if s.allow_file_writes:
+        _write_artist_photo_into_dirs(mbid, data, s.music_root, overwrite=True)
+
+    return {"ok": True, "artist_mbid": mbid, "bytes": len(data)}
+
+
+def _sniff_image_media_type(src: "bytes | PPath") -> "str | None":
+    """按 magic bytes 判 jpeg/png/webp; 不认识返回 None.
+    传 Path 时只读前 16 字节, 读不到 (空文件等) 当 jpeg 兜底 —— 老缓存全是 jpeg。
+    """
+    if isinstance(src, (bytes, bytearray)):
+        head = bytes(src[:16])
+    else:
+        try:
+            with open(src, "rb") as fh:
+                head = fh.read(16)
+        except OSError:
+            return "image/jpeg"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if isinstance(src, (bytes, bytearray)):
+        return None
+    return "image/jpeg"
+
+
+def _write_artist_photo_into_dirs(
+    mbid: str, data: bytes, music_root: PPath, *, overwrite: bool = False
+) -> None:
+    """通过 beets 数据找该艺人所有曲目，取 track.parent.parent 当作 artist dir。
+    overwrite=False (自动抓的) 不动已有 artist.jpg; 用户手动上传的传 True 覆盖。"""
     import logging  # noqa: PLC0415
 
     log = logging.getLogger(__name__)
@@ -2265,7 +2328,7 @@ def _write_artist_photo_into_dirs(mbid: str, data: bytes, music_root: PPath) -> 
         if not d.exists():
             continue
         target = d / "artist.jpg"
-        if target.exists():
+        if target.exists() and not overwrite:
             continue
         try:
             target.write_bytes(data)
@@ -2383,7 +2446,8 @@ def _local_dir_playable(mbid: str) -> dict:
         rows = conn.execute(
             text(
                 """SELECT id, path, title, format, bitrate, length,
-                          artist, mb_artistid, mb_albumartistid
+                          artist, mb_artistid, mb_albumartistid,
+                          track, disc, year
                    FROM beets.items
                    WHERE CAST(path AS TEXT) LIKE :p"""
             ),
@@ -2411,31 +2475,48 @@ def _local_dir_playable(mbid: str) -> dict:
                 (r.artist for r in rows if r.artist), ""
             )
 
-    orphan_items = []
+    # 本地兜底专辑: 目录里的文件就是曲目表 —— 按 碟/轨号 (整理时写进 beets 的) 排成 tracks,
+    # 每首自己就是 bound_item。以前全塞 orphan_items、tracks 留空, iOS 专辑页当成"没有曲目"。
+    items = []
     for r in rows:
         path = _decode(r.path)
-        orphan_items.append({
-            "id": int(r.id),
-            "title": r.title or "",
-            "format": (r.format or "").upper(),
-            "bitrate_kbps": int((r.bitrate or 0) // 1000),
-            "length_s": float(r.length or 0),
-            "path": path,
-            "filename": os.path.basename(path),
+        items.append((
+            int(r.disc or 0) or 1, int(r.track or 0), os.path.basename(path),
+            {
+                "id": int(r.id),
+                "title": r.title or "",
+                "format": (r.format or "").upper(),
+                "bitrate_kbps": int((r.bitrate or 0) // 1000),
+                "length_s": float(r.length or 0),
+                "path": path,
+                "filename": os.path.basename(path),
+            },
+        ))
+    items.sort(key=lambda x: (x[0], x[1] or 999, x[2]))
+    tracks = []
+    for i, (disc, no, fname, it) in enumerate(items, 1):
+        tracks.append({
+            "disc": disc,
+            "position": no or i,
+            "recording_mbid": "",
+            "title": it["title"] or os.path.splitext(fname)[0],
+            "length_s": it["length_s"],
+            "bound_item": it,
+            "alternatives_count": 0,
         })
-    orphan_items.sort(key=lambda x: x["filename"])
+    year = next((int(r.year) for r in rows if r.year), 0)
 
     return {
         "release_group_mbid": mbid,
         "title": os.path.basename(dir_path) or "(unknown)",
         "artist_mbid": artist_mbid,
         "artist": artist_name,
-        "first_release_date": "",
+        "first_release_date": str(year) if year else "",
         "primary_type": "Local",
-        "tracks": [],
-        "orphan_items": orphan_items,
-        "owned_count": 0,
-        "total_count": 0,
+        "tracks": tracks,
+        "orphan_items": [],
+        "owned_count": len(tracks),
+        "total_count": len(tracks),
         "is_local": False,
         "dirs": [dir_path] if rows else [],
     }

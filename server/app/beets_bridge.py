@@ -273,11 +273,15 @@ def set_item_meta(
     artist: str | None = None,
     album: str | None = None,
     track: int | None = None,
+    disc: int | None = None,
     track_mbid: str | None = None,
     releasegroup_mbid: str | None = None,
     artist_mbid: str | None = None,
     album_artist_mbid: str | None = None,
     album_artist: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
+    day: int | None = None,
 ) -> bool:
     """通用 metadata 写回。只动非 None 字段。
 
@@ -294,10 +298,14 @@ def set_item_meta(
             it.albumartist = album_artist
         if album is not None: it.album = album
         if track is not None: it.track = track
+        if disc is not None: it.disc = disc
         if track_mbid is not None: it.mb_trackid = track_mbid
         if releasegroup_mbid is not None: it.mb_releasegroupid = releasegroup_mbid
         if artist_mbid is not None: it.mb_artistid = artist_mbid
         if album_artist_mbid is not None: it.mb_albumartistid = album_artist_mbid
+        if year is not None: it.year = year
+        if month is not None: it.month = month
+        if day is not None: it.day = day
         it.store()
         return True
     return False

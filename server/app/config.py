@@ -21,6 +21,17 @@ class Settings(BaseSettings):
     # 设了 → all_roots = [music_root, ...额外的] (去重保序)
     music_roots: str = Field("", description="额外 root, 逗号分隔")
 
+    # ── source 收件箱（Music/，用户拷批次进来待整理；只读，扫描出提议）──
+    # 跟 music_root(=Library, 已整理) 分开: server 只伺候 Library,
+    # 整理流程扫 source_roots 出提议, 审批后才拷进 Library.
+    # env: SOURCE_ROOTS=/Volumes/NVMe/MusicTidy/Music
+    source_roots: str = Field("", description="收件箱根目录, 逗号分隔")
+
+    @property
+    def all_source_roots(self) -> list[Path]:
+        """待整理收件箱 (优先级序). 不设则空 = 没有收件箱."""
+        return [Path(p.strip()) for p in self.source_roots.split(",") if p.strip()]
+
     @property
     def all_roots(self) -> list[Path]:
         """实际扫描 / 路径解析时遍历的所有 root, music_root 永远第一个."""
@@ -94,6 +105,39 @@ class Settings(BaseSettings):
     @property
     def covers_dir(self) -> Path:
         return self.data_dir / "covers"
+
+    # ── 精选库 library（物化的独立副本，跟 source 彻底脱钩）──
+    # 多盘: 逗号分隔, 按优先级排; 写入时挑第一个剩余空间够的, 一个满了用下一个.
+    # env: LIBRARY_ROOTS=/Volumes/NVMe/MusicTidy/library,/Volumes/SSD/MusicTidyLib
+    # 不设 → 默认 data_dir/library (跟 db 同住, 备份一把梭).
+    library_roots: str = Field("", description="精选库根目录, 逗号分隔, 按优先级")
+    library_min_free_gb: int = Field(
+        5, description="某盘剩余空间低于此值就换下一个盘写"
+    )
+
+    @property
+    def all_library_roots(self) -> list[Path]:
+        """所有 library 盘 (优先级序). 不设则单盘 = data_dir/library."""
+        roots = [p.strip() for p in self.library_roots.split(",") if p.strip()]
+        if not roots:
+            return [self.music_root]
+        return [Path(r) for r in roots]
+
+    def active_library_root(self) -> Path:
+        """物化新文件时的写入目标: 第一个剩余空间 > library_min_free_gb 的盘;
+        都满了退回最后一个 (让上层报错, 不静默丢)."""
+        import shutil  # noqa: PLC0415
+
+        roots = self.all_library_roots
+        threshold = self.library_min_free_gb * (1024**3)
+        for r in roots:
+            probe = r if r.exists() else r.parent
+            try:
+                if shutil.disk_usage(probe).free > threshold:
+                    return r
+            except OSError:
+                continue
+        return roots[-1]
 
     # ── MusicBrainz ───────────────────────────────
     mb_user_agent: str = Field(

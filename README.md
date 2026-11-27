@@ -22,7 +22,32 @@ docs/      design notes, beets config example
 
 The iOS client is distributed via the App Store. Its source lives in a separate repository for now.
 
-## Quick start (self-host)
+## Quick start (Docker)
+
+```bash
+docker run -d --name musictidy -p 8000:8000 \
+  -e APP_PASSWORD=choose-a-password \
+  -e ACOUSTID_API_KEY=your-key \
+  -e ALLOW_FILE_WRITES=true \
+  -v musictidy-data:/data \
+  -v /path/to/Library:/music/library \
+  -v /path/to/Inbox:/music/inbox \
+  ghcr.io/wanpengqian/musictidy:latest
+# → http://localhost:8000
+```
+
+| Folder | What it is |
+|---|---|
+| `/data` | Databases, covers, transcode cache, trash. Keep it on a local disk: SQLite does not belong on an SMB/NFS share. |
+| `/music/library` | The sorted library the server plays from; approved albums are written here. |
+| `/music/inbox` | Where you drop new rips. MusicTidy reads them and proposes where they go. |
+
+The image (amd64 and arm64) contains the server, the organizer web page, ffmpeg, fpcalc and unar.
+Pin a version (`:0.3.0`) instead of `:latest` if you prefer to upgrade by hand. Leave
+`ALLOW_FILE_WRITES` out and MusicTidy only reads. Get a free AcoustID key at
+<https://acoustid.org/new-application>; without one, fingerprint matching is skipped.
+
+## Quick start (from source)
 
 ```bash
 # Debian / Ubuntu

@@ -207,7 +207,7 @@ def lookup_by_md5(md5: str) -> dict[str, Any] | None:
     with get_engine().connect() as conn:
         row = conn.execute(
             text(
-                """SELECT recording_mbid, release_group_mbid,
+                """SELECT recording_mbid, release_group_mbid, candidate_rgs,
                           title, artist, album, source, duration_s, fingerprint
                    FROM track_fingerprint
                    WHERE md5 = :m
@@ -219,9 +219,17 @@ def lookup_by_md5(md5: str) -> dict[str, Any] | None:
         ).first()
     if not row:
         return None
+    import json as _json  # noqa: PLC0415
+    cands: list[str] = []
+    if row.candidate_rgs:
+        try:
+            cands = _json.loads(row.candidate_rgs) or []
+        except (ValueError, TypeError):
+            cands = []
     return {
         "recording_mbid": row.recording_mbid or "",
         "release_group_mbid": row.release_group_mbid or "",
+        "candidate_rgs": cands,
         "title": row.title,
         "artist": row.artist,
         "album": row.album,

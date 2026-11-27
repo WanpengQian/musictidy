@@ -1,0 +1,105 @@
+name: docker
+
+# Builds the server image, starts it once to check it works, then pushes it to ghcr.io.
+#   main    → :latest and :sha-<commit>
+#   v1.2.3  → :1.2.3 and :1.2
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - server/**
+      - web/**
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/wanpengqian/musictidy
+
+jobs:
+  image:
+    # the public mirror (WanpengQian/musictidy) has no web/ and no Dockerfile: build only here
+    if: github.repository == 'WanpengQian/MusicTidyDev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (amd64, for the smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: musictidy:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          set -eu
+          mkdir -p t/data t/library t/inbox
+          docker run -d --name mt -p 8000:8000 \
+            -v "$PWD/t/data:/data" -v "$PWD/t/library:/music/library" -v "$PWD/t/inbox:/music/inbox" \
+            musictidy:test
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/healthz > healthz.json 2>/dev/null; then break; fi
+            sleep 2
+          done
+          docker logs mt | tail -40
+          cat healthz.json
+          grep -q '"app":"MusicTidy"' healthz.json
+          # the organizer web UI is in the image
+          curl -fsS http://127.0.0.1:8000/ | grep -qi '<html'
+          # the tools the server shells out to
+          docker exec mt sh -c 'ffmpeg -version | head -1; fpcalc -version; unar -v'
+          # the databases landed in the volume
+          ls -l t/data
+          test -f t/data/musictidy.db
+          # the image's own health check agrees
+          for i in $(seq 1 20); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' mt)
+            [ "$s" = healthy ] && break
+            sleep 3
+          done
+          echo "health: $s"; [ "$s" = healthy ]
+          docker rm -f mt
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=MusicTidy
+            org.opencontainers.image.description=Self-hosted music library server: sorts 20 years of rips, serves the iOS and web players
+            org.opencontainers.image.url=https://musictidy.com
+            org.opencontainers.image.source=https://github.com/WanpengQian/musictidy
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

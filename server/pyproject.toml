@@ -37,6 +37,9 @@ dependencies = [
     # 艺人名本地化排序: 中文拼音 / 日文假名(五十音)
     "pypinyin>=0.53",
     "pykakasi>=2.3",
+
+    # 整理: 简繁归一 (歌手/专辑名比较)
+    "opencc-python-reimplemented>=0.1.7",
 ]
 
 [project.optional-dependencies]

@@ -29,10 +29,19 @@ PUBLIC_PATH_PREFIXES = (
     "/docs",
     "/openapi.json",
     "/redoc",
+    "/assets/",              # SPA build 静态资源 (vite, 文件名带 hash)
 )
+
+# SPA 外壳: 这些精确路径公开 —— 客户端自己做登录, 受保护的是 /api/* (仍 401).
+# 用精确集合而非前缀, 否则 "/" 当前缀会 startswith 命中一切 = 全公开。
+PUBLIC_EXACT_PATHS = frozenset({
+    "/", "/index.html", "/organizer.html", "/favicon.svg", "/logo.png", "/icons.svg",
+})
 
 
 def is_public_path(path: str) -> bool:
+    if path in PUBLIC_EXACT_PATHS:
+        return True
     return any(path == p or path.startswith(p) for p in PUBLIC_PATH_PREFIXES)
 
 
